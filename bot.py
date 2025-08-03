@@ -315,8 +315,8 @@ async def weeklyrecap(ctx):
     current_week = league.current_week
     await ctx.send(f"✅ Live data pulled! Current week: {current_week}")
 
-    if __name__ == "__main__":
-        import asyncio
-        token = get_discord_bot_token()
-        asyncio.run(bot.start(token))
+if __name__ == "__main__":
+    import asyncio
+    token = get_discord_bot_token()
+    asyncio.run(bot.start(token))
 
