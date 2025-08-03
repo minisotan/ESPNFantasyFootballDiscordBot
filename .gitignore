@@ -1,0 +1,15 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment/config files
+.env
+config.py
+settings.json
+
+# VSCode project config (optional, but common)
+.vscode/
+
+# MacOS system files (optional, if you use macOS)
+.DS_Store
+
