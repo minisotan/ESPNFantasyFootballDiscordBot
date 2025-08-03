@@ -117,6 +117,7 @@ async def configure(
 async def autopost(interaction: discord.Interaction, enabled: bool):
     guild_id = str(interaction.guild.id)
     settings = get_guild_settings(guild_id)
+    print(f"🔧 Loaded settings: {settings}")
     if not settings:
         await interaction.response.send_message("❌ This server hasn't been set up. Use `/setup` first.", ephemeral=True)
         return
@@ -188,16 +189,42 @@ class WeekNavigator(View):
         await self.message.edit(embeds=self.week_embeds[self.index], view=self)
 
 async def weeklyrecap(ctx):
+    print("DEBUG: Entered weeklyrecap")
     guild_id = str(ctx.guild.id)
     settings = get_guild_settings(guild_id)
+    print(f"DEBUG: Settings loaded: {settings}")
 
     if not settings:
         await ctx.send("❌ This server has not been set up. Use `/setup` to configure your league.")
         return
 
     if ctx.channel.id != settings["channel_id"]:
+        print(f"🚫 Wrong channel: {ctx.channel.id} != {settings['channel_id']}")
+
         await ctx.send("❌ This command can only be used in the configured channel.")
         return
+###
+    try:
+        with open('weekly_data.json', 'r') as f:
+            weekly_data = json.load(f)
+        print("✅ Loaded weekly_data.json")
+    except Exception as e:
+        print(f"❌ Failed to load weekly_data.json: {e}")
+
+    try:
+        with open('top_players.json', 'r') as f:
+            top_players_data = json.load(f)
+        print("✅ Loaded top_players.json")
+    except Exception as e:
+        print(f"❌ Failed to load top_players.json: {e}")
+
+    try:
+        with open('team_stats.json', 'r') as f:
+            team_stats_data = json.load(f)
+        print("✅ Loaded team_stats.json")
+    except Exception as e:
+        print(f"❌ Failed to load team_stats.json: {e}")
+###
 
     with open('weekly_data.json', 'r') as f:
         weekly_data = json.load(f)
@@ -218,6 +245,7 @@ async def weeklyrecap(ctx):
         swid=settings["swid"],
         espn_s2=settings["espn_s2"]
     )
+    print(f"DEBUG: League loaded. Current week: {league.current_week}")
 
     week_embeds = []
 
@@ -315,6 +343,14 @@ async def weeklyrecap(ctx):
             embeds.append(embed)
 
         week_embeds.append(embeds)
+        
+        print(f"🧱 Generated {len(week_embeds)} weekly embed sets")
+
+    try:
+        msg = await ctx.send(embeds=week_embeds[latest_index], view=view)
+        print("📤 Sent embed message")
+    except Exception as e:
+        print(f"❌ Failed to send message: {e}")
 
     latest_index = len(week_embeds) - 1
     view = WeekNavigator(week_embeds)

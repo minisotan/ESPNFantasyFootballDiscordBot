@@ -42,6 +42,4 @@ def set_guild_settings(guild_id, league_id, season, swid, espn_s2, channel_id):
     save_settings(data)
 
 def get_discord_bot_token():
-    token = os.environ.get("DISCORD_TOKEN")
-    print(f"DISCORD_TOKEN FOUND: {bool(token)}")
-    return token
+    return os.environ.get("DISCORD_TOKEN")
