@@ -13,3 +13,5 @@ settings.json
 # MacOS system files (optional, if you use macOS)
 .DS_Store
 
+.ssh
+# ssh_public_key.txt
