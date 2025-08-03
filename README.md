@@ -1,4 +1,4 @@
-This is an app that keeps track of your Fantasy Football League
+This is an app that keeps track of your Fantasy Football League!
 
 In order to use it properly you need to get your: LEAGUE ID, SWID KEY, and ESPN_S2 KEY.
 
