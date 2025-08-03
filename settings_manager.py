@@ -42,4 +42,4 @@ def set_guild_settings(guild_id, league_id, season, swid, espn_s2, channel_id):
     save_settings(data)
 
 def get_discord_bot_token():
-    return os.environ.get("DISCORD_BOT_TOKEN")
+    return os.environ.get("DISCORD_TOKEN")
