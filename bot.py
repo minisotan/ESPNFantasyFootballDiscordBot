@@ -1,6 +1,4 @@
 import discord
-import json
-import os
 from discord.ext import commands
 from discord.ui import Button, View
 from discord import app_commands
@@ -9,9 +7,9 @@ from espn_api.football import League
 from settings_manager import (
     get_guild_settings,
     set_guild_settings,
+    set_autopost,
     get_discord_bot_token,
-    load_settings,
-    save_settings
+    init_db
 )
 
 intents = discord.Intents.default()
@@ -21,11 +19,6 @@ scheduler = AsyncIOScheduler()
 
 PLAYER_IMG = "https://a.espncdn.com/i/headshots/nfl/players/full/{player_id}.png"
 TEAM_IMG = "https://a.espncdn.com/i/teamlogos/nfl/500/{code}.png"
-
-SHOW_MATCHUPS = True
-SHOW_WEEKLY_TOP = True
-SHOW_TOP_5 = True
-SHOW_RANKINGS = True
 
 TEAM_LOGO = {
     "49ers": "sf", "Bears": "chi", "Bengals": "cin", "Bills": "buf", "Broncos": "den", "Browns": "cle",
@@ -38,28 +31,23 @@ TEAM_LOGO = {
 
 @bot.event
 async def on_ready():
+    await init_db()
     await bot.tree.sync()
     scheduler.start()
+    print(f"✅ Logged in as {bot.user}")
 
 @scheduler.scheduled_job("cron", day_of_week="tue", hour=15, minute=0)
 async def auto_post_weekly_recap():
-    for guild_id, config in load_settings().items():
-        if not config.get("autopost_enabled"):
+    for guild in bot.guilds:
+        settings = await get_guild_settings(str(guild.id))
+        if not settings or not settings.get("autopost_enabled"):
             continue
-
-        guild = bot.get_guild(int(guild_id))
-        if not guild:
-            continue
-
-        channel = guild.get_channel(config["channel_id"])
-        if not channel:
-            continue
-
-        msg = await channel.send("⏳ Auto-posting weekly recap...")
-        ctx = await bot.get_context(msg)
-        await weeklyrecap(ctx)
-        await msg.delete()
-    print(f"✅ Logged in as {bot.user}")
+        channel = guild.get_channel(settings["channel_id"])
+        if channel:
+            msg = await channel.send("⏳ Auto-posting weekly recap...")
+            ctx = await bot.get_context(msg)
+            await weeklyrecap(ctx)
+            await msg.delete()
 
 @bot.tree.command(name="setup", description="Set up your ESPN Fantasy League for this server")
 @app_commands.describe(
@@ -69,11 +57,8 @@ async def auto_post_weekly_recap():
     espn_s2="Your ESPN_S2 cookie"
 )
 async def setup(interaction: discord.Interaction, league_id: int, season: int, swid: str, espn_s2: str):
-    guild_id = interaction.guild.id
-    channel_id = interaction.channel.id
-    set_guild_settings(guild_id, league_id, season, swid, espn_s2, channel_id)
-    await interaction.response.send_message(f"✅ Setup complete! League ID: `{league_id}` Season: `{season}` Channel: <#{channel_id}>", ephemeral=True)
-
+    await set_guild_settings(interaction.guild.id, league_id, season, swid, espn_s2, interaction.channel.id)
+    await interaction.response.send_message(f"✅ Setup complete! League ID: `{league_id}` Season: `{season}`", ephemeral=True)
 
 @bot.tree.command(name="configure", description="Update ESPN league info or change the bot’s posting channel")
 @app_commands.describe(
@@ -92,7 +77,7 @@ async def configure(
     channel: discord.TextChannel = None
 ):
     guild_id = str(interaction.guild.id)
-    current = get_guild_settings(guild_id)
+    current = await get_guild_settings(guild_id)
     if not current:
         await interaction.response.send_message("❌ This server hasn't been set up yet. Use `/setup` first.", ephemeral=True)
         return
@@ -102,34 +87,23 @@ async def configure(
         "season": season or current["season"],
         "swid": swid or current["swid"],
         "espn_s2": espn_s2 or current["espn_s2"],
-        "channel_id": channel.id if channel else current["channel_id"],
-        "autopost_enabled": current.get("autopost_enabled", False)
+        "channel_id": channel.id if channel else current["channel_id"]
     }
 
-    settings = load_settings()
-    settings[guild_id] = updated
-    save_settings(settings)
+    await set_guild_settings(guild_id, **updated)
     await interaction.response.send_message("✅ Settings updated successfully!", ephemeral=True)
-
 
 @bot.tree.command(name="autopost", description="Enable or disable automatic weekly recaps")
 @app_commands.describe(enabled="Set to true to enable, false to disable")
 async def autopost(interaction: discord.Interaction, enabled: bool):
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_settings(guild_id)
-    print(f"🔧 Loaded settings: {settings}")
+    settings = await get_guild_settings(str(interaction.guild.id))
     if not settings:
         await interaction.response.send_message("❌ This server hasn't been set up. Use `/setup` first.", ephemeral=True)
         return
 
-    settings["autopost_enabled"] = enabled
-    all_settings = load_settings()
-    all_settings[guild_id] = settings
-    save_settings(all_settings)
-
-    status = "✅ Auto-posting enabled! Recaps will post Tuesdays at 11:00 AM EST." if enabled else "❌ Auto-posting disabled."
-    await interaction.response.send_message(status, ephemeral=True)
-
+    await set_autopost(str(interaction.guild.id), enabled)
+    msg = "✅ Auto-posting enabled! Weekly recaps will post Tuesdays at 11:00 AM EST." if enabled else "❌ Auto-posting disabled."
+    await interaction.response.send_message(msg, ephemeral=True)
 
 @bot.tree.command(name="weeklyrecap", description="Manually trigger a weekly recap")
 async def weeklyrecap_slash(interaction: discord.Interaction):
@@ -139,105 +113,18 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
     await weeklyrecap(ctx)
     await msg.delete()
 
-class WeekNavigator(View):
-    def __init__(self, week_embeds):
-        super().__init__(timeout=None)
-        self.week_embeds = week_embeds
-        self.index = len(week_embeds) - 1
-        self.message = None
-
-        self.select = discord.ui.Select(placeholder="Select a week")
-        for i in range(len(week_embeds)):
-            self.select.add_option(label=f"Week {i + 1}", value=str(i))
-        self.select.callback = self.jump_to_week
-        self.add_item(self.select)
-
-    def set_message(self, msg):
-        self.message = msg
-        self.update_button_states()
-
-    def update_button_states(self):
-        self.children[0].disabled = (self.index == 0)  # ⬅️
-        self.children[1].disabled = (self.index == len(self.week_embeds) - 1)  # ➡️
-
-    @discord.ui.button(label="⬅️", style=discord.ButtonStyle.primary)
-    async def previous(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer()
-        if self.index > 0:
-            self.index -= 1
-        self.update_button_states()
-        await self.message.edit(embeds=self.week_embeds[self.index], view=self)
-
-    @discord.ui.button(label="➡️", style=discord.ButtonStyle.primary)
-    async def next(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer()
-        if self.index < len(self.week_embeds) - 1:
-            self.index += 1
-        await self.message.edit(embeds=self.week_embeds[self.index], view=self)
-
-    @discord.ui.button(label="⏹ Reset", style=discord.ButtonStyle.danger)
-    async def reset(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer()
-        self.index = len(self.week_embeds) - 1
-        self.update_button_states()
-        await self.message.edit(embeds=self.week_embeds[self.index], view=self)
-
-    async def jump_to_week(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        self.index = int(self.select.values[0])
-        self.update_button_states()
-        await self.message.edit(embeds=self.week_embeds[self.index], view=self)
-
+# Placeholder for your actual weeklyrecap logic
 async def weeklyrecap(ctx):
-    print("DEBUG: Entered weeklyrecap")
+    from discord import Embed
     guild_id = str(ctx.guild.id)
-    settings = get_guild_settings(guild_id)
-    print(f"DEBUG: Settings loaded: {settings}")
+    settings = await get_guild_settings(guild_id)
 
     if not settings:
         await ctx.send("❌ This server has not been set up. Use `/setup` to configure your league.")
         return
-
     if ctx.channel.id != settings["channel_id"]:
-        print(f"🚫 Wrong channel: {ctx.channel.id} != {settings['channel_id']}")
-
         await ctx.send("❌ This command can only be used in the configured channel.")
         return
-###
-    try:
-        with open('weekly_data.json', 'r') as f:
-            weekly_data = json.load(f)
-        print("✅ Loaded weekly_data.json")
-    except Exception as e:
-        print(f"❌ Failed to load weekly_data.json: {e}")
-
-    try:
-        with open('top_players.json', 'r') as f:
-            top_players_data = json.load(f)
-        print("✅ Loaded top_players.json")
-    except Exception as e:
-        print(f"❌ Failed to load top_players.json: {e}")
-
-    try:
-        with open('team_stats.json', 'r') as f:
-            team_stats_data = json.load(f)
-        print("✅ Loaded team_stats.json")
-    except Exception as e:
-        print(f"❌ Failed to load team_stats.json: {e}")
-###
-
-    with open('weekly_data.json', 'r') as f:
-        weekly_data = json.load(f)
-
-    if not weekly_data:
-        await ctx.send("❌ No weekly data found.")
-        return
-
-    with open('top_players.json', 'r') as f:
-        top_players_data = json.load(f)
-
-    with open('team_stats.json', 'r') as f:
-        team_stats_data = json.load(f)
 
     league = League(
         league_id=settings["league_id"],
@@ -245,116 +132,191 @@ async def weeklyrecap(ctx):
         swid=settings["swid"],
         espn_s2=settings["espn_s2"]
     )
-    print(f"DEBUG: League loaded. Current week: {league.current_week}")
 
+    current_week = league.current_week
     week_embeds = []
 
-    for week_entry in weekly_data:
-        week_label = week_entry['Week']
+    for week in range(1, current_week + 1):
         embeds = []
 
-        if SHOW_MATCHUPS:
-            try:
-                box_scores = league.box_scores(week=int(week_label.split()[-1]))
-                embed = discord.Embed(
-                    title=f"{week_label} Head-to-Head Matchups",
-                    description="🏈 Weekly fantasy results",
-                    color=0xf39c12
+        # === HEAD-TO-HEAD MATCHUPS ===
+        try:
+            box_scores = league.box_scores(week=week)
+            matchup_embed = Embed(
+                title=f"Week {week} Head-to-Head Matchups",
+                description="🏈 Weekly fantasy results",
+                color=0xf39c12
+            )
+            for game in box_scores:
+                home = game.home_team
+                away = game.away_team
+                home_score = game.home_score
+                away_score = game.away_score
+
+                winner = home if home_score > away_score else away
+                win_score = max(home_score, away_score)
+
+                result = (
+                    f"{home.team_name} ({home.wins}-{home.losses}) vs. {away.team_name} ({away.wins}-{away.losses})\n"
+                    f"Score: {home_score:.1f} - {away_score:.1f}\n"
+                    f"🏆 Winner: **{winner.team_name}** (**{win_score:.1f}**)"
                 )
-                embed.set_footer(text=f"Week {len(week_embeds)+1} of {len(weekly_data)}")
+                matchup_embed.add_field(name="Matchup", value=result, inline=False)
 
-                for game in box_scores:
-                    try:
-                        home = game.home_team
-                        away = game.away_team
-                        home_score = game.home_score
-                        away_score = game.away_score
+            embeds.append(matchup_embed)
+        except Exception as e:
+            print(f"❌ Failed to fetch box scores for week {week}: {e}")
 
-                        if not hasattr(home, 'team_name') or not hasattr(away, 'team_name'):
-                            continue
+        # === TOP PLAYER PER POSITION THIS WEEK ===
+        try:
+            players = []
+            for team in league.teams:
+                roster = team.roster
+                for player in roster:
+                    if player.stats and week in player.stats:
+                        players.append({
+                            "name": player.name,
+                            "position": player.position,
+                            "points": player.stats[week],
+                            "id": player.playerId
+                        })
 
-                        winner = home if home_score > away_score else away
-                        win_score = max(home_score, away_score)
-
-                        result = (
-                            f"{home.team_name} ({home.wins}-{home.losses}) vs. {away.team_name} ({away.wins}-{away.losses})\n"
-                            f"Score: {home_score} - {away_score}\n"
-                            f"🏆 Winner: **{winner.team_name}** (**{win_score}**)"
-                        )
-                        embed.add_field(name="", value=result, inline=False)
-                    except Exception as e:
-                        print(f"Skipping bad box score in {week_label}: {e}")
-
-                embeds.append(embed)
-            except Exception as e:
-                print(f"Failed to get box scores: {e}")
-
-        if SHOW_WEEKLY_TOP:
-            for pos in ['QB', 'RB', 'WR', 'TE', 'D/ST', 'K']:
-                name = week_entry.get(f"{pos} Player", "")
-                points = week_entry.get(f"{pos} Points", "")
-                player_id = week_entry.get(f"{pos} ID", "")
-
-                image_url = None
-                if pos == 'D/ST' and name:
-                    code = TEAM_LOGO.get(name.replace(" D/ST", "").strip())
-                    if code:
-                        image_url = TEAM_IMG.format(code=code)
-                elif player_id:
-                    image_url = PLAYER_IMG.format(player_id=player_id)
-
-                embed = discord.Embed(
-                    title=f"{week_label} Top {pos}",
-                    description=f"**{name}**\nFantasy Points: **{points}**",
-                    color=0x1abc9c
-                )
-                if image_url:
+            positions = ['QB', 'RB', 'WR', 'TE', 'K', 'D/ST']
+            for pos in positions:
+                top = max((p for p in players if p['position'] == pos), key=lambda x: x['points'], default=None)
+                if top:
+                    image_url = (
+                        TEAM_IMG.format(code=TEAM_LOGO.get(top['name'].replace(" D/ST", ""), ""))
+                        if pos == "D/ST" else PLAYER_IMG.format(player_id=top['id'])
+                    )
+                    embed = Embed(
+                        title=f"Week {week} Top {pos}",
+                        description=f"**{top['name']}**\nFantasy Points: **{top['points']:.2f}**",
+                        color=0x1abc9c
+                    )
                     embed.set_thumbnail(url=image_url)
+                    embeds.append(embed)
+        except Exception as e:
+            print(f"❌ Failed to generate top players for week {week}: {e}")
 
-                embeds.append(embed)
+        # === TOP 5 PLAYERS PER POSITION (SEASON TOTAL) ===
+        try:
+            all_players = []
+            for team in league.teams:
+                for player in team.roster:
+                    total = sum(player.stats.values())
+                    avg = total / len(player.stats) if player.stats else 0
+                    all_players.append({
+                        "name": player.name,
+                        "position": player.position,
+                        "total": total,
+                        "avg": avg
+                    })
 
-        if SHOW_TOP_5:
-            embed = discord.Embed(
+            top_embed = Embed(
                 title="🏅 Season Top 5 by Position",
-                description="Here are the top 5 performers at each position.",
+                description="Sorted by total points",
                 color=0x9b59b6
             )
-            for pos in ['QB', 'RB', 'WR', 'TE', 'D/ST', 'K']:
-                top_players = [p for p in top_players_data if p['Position'] == pos][:5]
-                field_value = "\n".join(
-                    f"{i + 1}. {p['Player']} — {p['Total Points']} pts (Avg: {p['Average Points']})"
-                    for i, p in enumerate(top_players)
-                )
-                embed.add_field(name=f"Top 5 {pos}s", value=field_value, inline=False)
-            embeds.append(embed)
 
-        if SHOW_RANKINGS:
-            embed = discord.Embed(
+            for pos in positions:
+                top5 = sorted(
+                    (p for p in all_players if p['position'] == pos),
+                    key=lambda x: x['total'],
+                    reverse=True
+                )[:5]
+                field = "\n".join(
+                    f"{i+1}. {p['name']} — {p['total']:.1f} pts (Avg: {p['avg']:.1f})"
+                    for i, p in enumerate(top5)
+                )
+                top_embed.add_field(name=f"Top 5 {pos}s", value=field, inline=False)
+
+            embeds.append(top_embed)
+        except Exception as e:
+            print(f"❌ Failed to generate top 5 players: {e}")
+
+        # === POWER RANKINGS ===
+        try:
+            sorted_teams = sorted(league.teams, key=lambda t: (-t.wins, -t.points_for))
+            power_embed = Embed(
                 title="📊 Power Rankings",
                 description="Sorted by Wins, then Points",
                 color=0x2980b9
             )
-            for i, team in enumerate(team_stats_data, 1):
-                embed.add_field(
-                    name=f"{i}. {team['Team Name'].strip()}",
-                    value=f"Record: {team['Wins']}-{team['Losses']} | Total Pts: {team['Total Points']}",
+            for i, team in enumerate(sorted_teams, 1):
+                power_embed.add_field(
+                    name=f"{i}. {team.team_name.strip()}",
+                    value=f"Record: {team.wins}-{team.losses} | Total Pts: {team.points_for:.1f}",
                     inline=False
                 )
-            embeds.append(embed)
+            embeds.append(power_embed)
+        except Exception as e:
+            print(f"❌ Failed to generate power rankings: {e}")
 
         week_embeds.append(embeds)
-        
-        print(f"🧱 Generated {len(week_embeds)} weekly embed sets")
 
-    try:
-        msg = await ctx.send(embeds=week_embeds[latest_index], view=view)
-        print("📤 Sent embed message")
-    except Exception as e:
-        print(f"❌ Failed to send message: {e}")
+    # === PAGINATION VIEW ===
+    class WeekNavigator(View):
+        def __init__(self, week_embeds):
+            super().__init__(timeout=None)
+            self.week_embeds = week_embeds
+            self.index = len(week_embeds) - 1
+            self.message = None
+
+            self.select = discord.ui.Select(placeholder="Select a week")
+            for i in range(len(week_embeds)):
+                self.select.add_option(label=f"Week {i + 1}", value=str(i))
+            self.select.callback = self.jump_to_week
+            self.add_item(self.select)
+
+        def set_message(self, msg):
+            self.message = msg
+            self.update_button_states()
+
+        def update_button_states(self):
+            self.children[0].disabled = (self.index == 0)
+            self.children[1].disabled = (self.index == len(self.week_embeds) - 1)
+
+        @discord.ui.button(label="⬅️", style=discord.ButtonStyle.primary)
+        async def previous(self, interaction: discord.Interaction, button: Button):
+            await interaction.response.defer()
+            if self.index > 0:
+                self.index -= 1
+            self.update_button_states()
+            await self.message.edit(embeds=self.week_embeds[self.index], view=self)
+
+        @discord.ui.button(label="➡️", style=discord.ButtonStyle.primary)
+        async def next(self, interaction: discord.Interaction, button: Button):
+            await interaction.response.defer()
+            if self.index < len(self.week_embeds) - 1:
+                self.index += 1
+            self.update_button_states()
+            await self.message.edit(embeds=self.week_embeds[self.index], view=self)
+
+        @discord.ui.button(label="⏹ Reset", style=discord.ButtonStyle.danger)
+        async def reset(self, interaction: discord.Interaction, button: Button):
+            await interaction.response.defer()
+            self.index = len(self.week_embeds) - 1
+            self.update_button_states()
+            await self.message.edit(embeds=self.week_embeds[self.index], view=self)
+
+        async def jump_to_week(self, interaction: discord.Interaction):
+            await interaction.response.defer()
+            self.index = int(self.select.values[0])
+            self.update_button_states()
+            await self.message.edit(embeds=self.week_embeds[self.index], view=self)
 
     latest_index = len(week_embeds) - 1
     view = WeekNavigator(week_embeds)
     msg = await ctx.send(embeds=week_embeds[latest_index], view=view)
     view.set_message(msg)
 
-bot.run(get_discord_bot_token())
+
+    current_week = league.current_week
+    await ctx.send(f"✅ Live data pulled! Current week: {current_week}")
+
+    if __name__ == "__main__":
+        import asyncio
+        token = get_discord_bot_token()
+        asyncio.run(bot.start(token))
+
