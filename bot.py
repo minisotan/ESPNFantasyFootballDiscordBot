@@ -113,58 +113,6 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
     await weeklyrecap(ctx)
     await msg.delete()
 
-def get_top_weekly_players(league, week, positions, player_img_url, team_img_url, team_logos):
-    import discord
-
-    top_performers = {pos: {"player": None, "points": -1} for pos in positions}
-
-    # Loop through all teams and players for the week
-    for team in league.teams:
-        for player in team.roster:
-            pos = player.position
-            if pos not in top_performers:
-                continue
-
-            week_points = player.stats.get(week)
-            if not isinstance(week_points, (int, float)):
-                continue
-
-            if week_points > top_performers[pos]["points"]:
-                top_performers[pos] = {
-                    "player": player,
-                    "points": week_points
-                }
-
-    embeds = []
-    for pos in positions:
-        entry = top_performers[pos]
-        player = entry["player"]
-        points = entry["points"]
-
-        if not player:
-            continue
-
-        # Get image URL
-        if pos == "D/ST":
-            team_name = player.name.replace(" D/ST", "").strip()
-            team_code = team_logos.get(team_name)
-            image_url = team_img_url.format(code=team_code) if team_code else None
-        else:
-            image_url = player_img_url.format(player_id=player.playerId)
-
-        # Build embed
-        embed = discord.Embed(
-            title=f"Week {week} Top {pos}",
-            description=f"**{player.name}**\nFantasy Points: **{points:.2f}**",
-            color=0x1abc9c
-        )
-        if image_url:
-            embed.set_thumbnail(url=image_url)
-
-        embeds.append(embed)
-
-    return embeds
-
 # Placeholder for your actual weeklyrecap logic
 async def weeklyrecap(ctx):
     from discord import Embed
@@ -202,9 +150,6 @@ async def weeklyrecap(ctx):
             for game in box_scores:
                 home = game.home_team
                 away = game.away_team
-
-                if not hasattr(home, 'team_name') or not hasattr(away, 'team_name'):
-                    continue
                 home_score = game.home_score
                 away_score = game.away_score
 
@@ -224,28 +169,43 @@ async def weeklyrecap(ctx):
 
         # === TOP PLAYER PER POSITION THIS WEEK ===
         try:
+            players = []
+            for team in league.teams:
+                roster = team.roster
+                for player in roster:
+                    if player.stats and week in player.stats:
+                        players.append({
+                            "name": player.name,
+                            "position": player.position,
+                            "points": player.stats[week],
+                            "id": player.playerId
+                        })
+
             positions = ['QB', 'RB', 'WR', 'TE', 'K', 'D/ST']
-            top_player_embeds = get_top_weekly_players(
-                league=league,
-                week=week,
-                positions=positions,
-                player_img_url=PLAYER_IMG,
-                team_img_url=TEAM_IMG,
-                team_logos=TEAM_LOGO
-            )
-            embeds.extend(top_player_embeds)
+            for pos in positions:
+                top = max((p for p in players if p['position'] == pos), key=lambda x: x['points'], default=None)
+                if top:
+                    image_url = (
+                        TEAM_IMG.format(code=TEAM_LOGO.get(top['name'].replace(" D/ST", ""), ""))
+                        if pos == "D/ST" else PLAYER_IMG.format(player_id=top['id'])
+                    )
+                    embed = Embed(
+                        title=f"Week {week} Top {pos}",
+                        description=f"**{top['name']}**\nFantasy Points: **{top['points']:.2f}**",
+                        color=0x1abc9c
+                    )
+                    embed.set_thumbnail(url=image_url)
+                    embeds.append(embed)
         except Exception as e:
             print(f"❌ Failed to generate top players for week {week}: {e}")
-
 
         # === TOP 5 PLAYERS PER POSITION (SEASON TOTAL) ===
         try:
             all_players = []
             for team in league.teams:
                 for player in team.roster:
-                    points = [v for v in player.stats.values() if isinstance(v, (int, float))]
-                    total = sum(points)
-                    avg = total / len(points) if points else 0
+                    total = sum(player.stats.values())
+                    avg = total / len(player.stats) if player.stats else 0
                     all_players.append({
                         "name": player.name,
                         "position": player.position,
@@ -359,3 +319,4 @@ if __name__ == "__main__":
     import asyncio
     token = get_discord_bot_token()
     asyncio.run(bot.start(token))
+
