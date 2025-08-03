@@ -171,14 +171,13 @@ async def weeklyrecap(ctx):
         try:
             players = []
             for team in league.teams:
-                roster = team.roster
-                for player in roster:
-                    stats = player.get_week_stats(week)
-                    if player.stats and week in player.stats:
+                for player in team.roster:
+                    stats = player.stats.get(week)
+                    if stats and isinstance(stats, dict) and 'points' in stats:
                         players.append({
                             "name": player.name,
                             "position": player.position,
-                            "points": player.stats[week],
+                            "points": stats['points'],
                             "id": player.playerId,
                             "team": team.team_name
                         })
@@ -191,9 +190,13 @@ async def weeklyrecap(ctx):
                         TEAM_IMG.format(code=TEAM_LOGO.get(top['name'].replace(" D/ST", ""), ""))
                         if pos == "D/ST" else PLAYER_IMG.format(player_id=top['id'])
                     )
-                    embed = Embed(
+                    embed = discord.Embed(
                         title=f"Week {week} Top {pos}",
-                        description=f"**{top['name']}**\nFantasy Points: **{top['points']:.2f}**\nTeam: *{top['team']}*",
+                        description=(
+                            f"**{top['name']}**\n"
+                            f"Fantasy Points: **{top['points']:.2f}**\n"
+                            f"Team: *{top['team']}*"
+                        ),
                         color=0x1abc9c
                     )
                     embed.set_thumbnail(url=image_url)
@@ -201,61 +204,63 @@ async def weeklyrecap(ctx):
         except Exception as e:
             print(f"❌ Failed to generate top players for week {week}: {e}")
 
-        # === TOP 5 PLAYERS PER POSITION (SEASON TOTAL) ===
-        try:
-            all_players = []
-            for team in league.teams:
-                for player in team.roster:
-                    total = sum(player.stats.values())
-                    avg = total / len(player.stats) if player.stats else 0
-                    all_players.append({
-                        "name": player.name,
-                        "position": player.position,
-                        "total": total,
-                        "avg": avg
-                    })
 
-            top_embed = Embed(
-                title="🏅 Season Top 5 by Position",
-                description="Sorted by total points",
-                color=0x9b59b6
-            )
+            # === TOP 5 PLAYERS PER POSITION (SEASON TOTAL) ===
+            try:
+                all_players = []
+                for team in league.teams:
+                    for player in team.roster:
+                        total = sum(week.get('points', 0) for week in player.stats.values() if isinstance(week, dict))
+                        valid_weeks = [week for week in player.stats.values() if isinstance(week, dict) and 'points' in week]
+                        avg = total / len(valid_weeks) if valid_weeks else 0
+                        all_players.append({
+                            "name": player.name,
+                            "position": player.position,
+                            "total": total,
+                            "avg": avg
+                        })
 
-            for pos in positions:
-                top5 = sorted(
-                    (p for p in all_players if p['position'] == pos),
-                    key=lambda x: x['total'],
-                    reverse=True
-                )[:5]
-                field = "\n".join(
-                    f"{i+1}. {p['name']} — {p['total']:.1f} pts (Avg: {p['avg']:.1f})"
-                    for i, p in enumerate(top5)
+                top_embed = discord.Embed(
+                    title="🏅 Season Top 5 by Position",
+                    description="Sorted by total points",
+                    color=0x9b59b6
                 )
-                top_embed.add_field(name=f"Top 5 {pos}s", value=field, inline=False)
 
-            embeds.append(top_embed)
-        except Exception as e:
-            print(f"❌ Failed to generate top 5 players: {e}")
+                for pos in positions:
+                    top5 = sorted(
+                        (p for p in all_players if p['position'] == pos),
+                        key=lambda x: x['total'],
+                        reverse=True
+                    )[:5]
+                    field = "\n".join(
+                        f"{i+1}. {p['name']} — {p['total']:.1f} pts (Avg: {p['avg']:.1f})"
+                        for i, p in enumerate(top5)
+                    )
+                    top_embed.add_field(name=f"Top 5 {pos}s", value=field, inline=False)
 
-        # === POWER RANKINGS ===
-        try:
-            sorted_teams = sorted(league.teams, key=lambda t: (-t.wins, -t.points_for))
-            power_embed = Embed(
-                title="📊 Power Rankings",
-                description="Sorted by Wins, then Points",
-                color=0x2980b9
-            )
-            for i, team in enumerate(sorted_teams, 1):
-                power_embed.add_field(
-                    name=f"{i}. {team.team_name.strip()}",
-                    value=f"Record: {team.wins}-{team.losses} | Total Pts: {team.points_for:.1f}",
-                    inline=False
-                )
-            embeds.append(power_embed)
-        except Exception as e:
-            print(f"❌ Failed to generate power rankings: {e}")
+                embeds.append(top_embed)
+            except Exception as e:
+                print(f"❌ Failed to generate top 5 players: {e}")
 
-        week_embeds.append(embeds)
+                # === POWER RANKINGS ===
+                try:
+                    sorted_teams = sorted(league.teams, key=lambda t: (-t.wins, -t.points_for))
+                    power_embed = Embed(
+                        title="📊 Power Rankings",
+                        description="Sorted by Wins, then Points",
+                        color=0x2980b9
+                    )
+                    for i, team in enumerate(sorted_teams, 1):
+                        power_embed.add_field(
+                            name=f"{i}. {team.team_name.strip()}",
+                            value=f"Record: {team.wins}-{team.losses} | Total Pts: {team.points_for:.1f}",
+                            inline=False
+                        )
+                    embeds.append(power_embed)
+                except Exception as e:
+                    print(f"❌ Failed to generate power rankings: {e}")
+
+                week_embeds.append(embeds)
 
     # === PAGINATION VIEW ===
     class WeekNavigator(View):
