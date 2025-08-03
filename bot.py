@@ -150,6 +150,9 @@ async def weeklyrecap(ctx):
             for game in box_scores:
                 home = game.home_team
                 away = game.away_team
+
+                if not hasattr(home, 'team_name') or not hasattr(away, 'team_name'):
+                    continue
                 home_score = game.home_score
                 away_score = game.away_score
 
@@ -171,9 +174,8 @@ async def weeklyrecap(ctx):
         try:
             players = []
             for team in league.teams:
-                roster = team.roster
-                for player in roster:
-                    if player.stats and week in player.stats:
+                for player in team.roster:
+                    if player.stats and isinstance(player.stats.get(week), (int, float)):
                         players.append({
                             "name": player.name,
                             "position": player.position,
@@ -184,18 +186,25 @@ async def weeklyrecap(ctx):
             positions = ['QB', 'RB', 'WR', 'TE', 'K', 'D/ST']
             for pos in positions:
                 top = max((p for p in players if p['position'] == pos), key=lambda x: x['points'], default=None)
-                if top:
-                    image_url = (
-                        TEAM_IMG.format(code=TEAM_LOGO.get(top['name'].replace(" D/ST", ""), ""))
-                        if pos == "D/ST" else PLAYER_IMG.format(player_id=top['id'])
-                    )
-                    embed = Embed(
-                        title=f"Week {week} Top {pos}",
-                        description=f"**{top['name']}**\nFantasy Points: **{top['points']:.2f}**",
-                        color=0x1abc9c
-                    )
+                if not top:
+                    continue
+
+                if pos == "D/ST":
+                    team_name = top["name"].replace(" D/ST", "").strip()
+                    team_code = TEAM_LOGO.get(team_name)
+                    image_url = TEAM_IMG.format(code=team_code) if team_code else None
+                else:
+                    image_url = PLAYER_IMG.format(player_id=top["id"])
+
+                embed = discord.Embed(
+                    title=f"Week {week} Top {pos}",
+                    description=f"**{top['name']}**\nFantasy Points: **{top['points']:.2f}**",
+                    color=0x1abc9c
+                )
+                if image_url:
                     embed.set_thumbnail(url=image_url)
-                    embeds.append(embed)
+
+                embeds.append(embed)
         except Exception as e:
             print(f"❌ Failed to generate top players for week {week}: {e}")
 
