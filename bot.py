@@ -113,7 +113,7 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
     await weeklyrecap(ctx)
     await msg.delete()
 
-# Placeholder for your actual weeklyrecap logic
+# === Weekly Recap Logic ===
 async def weeklyrecap(ctx):
     from discord import Embed
     guild_id = str(ctx.guild.id)
@@ -126,12 +126,16 @@ async def weeklyrecap(ctx):
         await ctx.send("❌ This command can only be used in the configured channel.")
         return
 
-    league = League(
-        league_id=settings["league_id"],
-        year=settings["season"],
-        swid=settings["swid"],
-        espn_s2=settings["espn_s2"]
-    )
+    try:
+        league = League(
+            league_id=settings["league_id"],
+            year=settings["season"],
+            swid=settings["swid"],
+            espn_s2=settings["espn_s2"]
+        )
+    except Exception as e:
+        await ctx.send(f"❌ Failed to connect to ESPN: {e}")
+        return
 
     current_week = league.current_week
     week_embeds = []
@@ -204,63 +208,67 @@ async def weeklyrecap(ctx):
         except Exception as e:
             print(f"❌ Failed to generate top players for week {week}: {e}")
 
+        # === TOP 5 PLAYERS PER POSITION (SEASON TOTAL) ===
+        try:
+            all_players = []
+            for team in league.teams:
+                for player in team.roster:
+                    total = sum(week.get('points', 0) for week in player.stats.values() if isinstance(week, dict))
+                    valid_weeks = [week for week in player.stats.values() if isinstance(week, dict) and 'points' in week]
+                    avg = total / len(valid_weeks) if valid_weeks else 0
+                    all_players.append({
+                        "name": player.name,
+                        "position": player.position,
+                        "total": total,
+                        "avg": avg
+                    })
 
-            # === TOP 5 PLAYERS PER POSITION (SEASON TOTAL) ===
-            try:
-                all_players = []
-                for team in league.teams:
-                    for player in team.roster:
-                        total = sum(week.get('points', 0) for week in player.stats.values() if isinstance(week, dict))
-                        valid_weeks = [week for week in player.stats.values() if isinstance(week, dict) and 'points' in week]
-                        avg = total / len(valid_weeks) if valid_weeks else 0
-                        all_players.append({
-                            "name": player.name,
-                            "position": player.position,
-                            "total": total,
-                            "avg": avg
-                        })
+            top_embed = discord.Embed(
+                title="🏅 Season Top 5 by Position",
+                description="Sorted by total points",
+                color=0x9b59b6
+            )
 
-                top_embed = discord.Embed(
-                    title="🏅 Season Top 5 by Position",
-                    description="Sorted by total points",
-                    color=0x9b59b6
+            for pos in ['QB', 'RB', 'WR', 'TE', 'K', 'D/ST']:
+                top5 = sorted(
+                    (p for p in all_players if p['position'] == pos),
+                    key=lambda x: x['total'],
+                    reverse=True
+                )[:5]
+                field = "\n".join(
+                    f"{i+1}. {p['name']} — {p['total']:.1f} pts (Avg: {p['avg']:.1f})"
+                    for i, p in enumerate(top5)
                 )
+                top_embed.add_field(name=f"Top 5 {pos}s", value=field or "No data", inline=False)
 
-                for pos in positions:
-                    top5 = sorted(
-                        (p for p in all_players if p['position'] == pos),
-                        key=lambda x: x['total'],
-                        reverse=True
-                    )[:5]
-                    field = "\n".join(
-                        f"{i+1}. {p['name']} — {p['total']:.1f} pts (Avg: {p['avg']:.1f})"
-                        for i, p in enumerate(top5)
-                    )
-                    top_embed.add_field(name=f"Top 5 {pos}s", value=field, inline=False)
+            embeds.append(top_embed)
+        except Exception as e:
+            print(f"❌ Failed to generate top 5 players: {e}")
 
-                embeds.append(top_embed)
-            except Exception as e:
-                print(f"❌ Failed to generate top 5 players: {e}")
+        # === POWER RANKINGS ===
+        try:
+            sorted_teams = sorted(league.teams, key=lambda t: (-t.wins, -t.points_for))
+            power_embed = Embed(
+                title="📊 Power Rankings",
+                description="Sorted by Wins, then Points",
+                color=0x2980b9
+            )
+            for i, team in enumerate(sorted_teams, 1):
+                power_embed.add_field(
+                    name=f"{i}. {team.team_name.strip()}",
+                    value=f"Record: {team.wins}-{team.losses} | Total Pts: {team.points_for:.1f}",
+                    inline=False
+                )
+            embeds.append(power_embed)
+        except Exception as e:
+            print(f"❌ Failed to generate power rankings: {e}")
 
-                # === POWER RANKINGS ===
-                try:
-                    sorted_teams = sorted(league.teams, key=lambda t: (-t.wins, -t.points_for))
-                    power_embed = Embed(
-                        title="📊 Power Rankings",
-                        description="Sorted by Wins, then Points",
-                        color=0x2980b9
-                    )
-                    for i, team in enumerate(sorted_teams, 1):
-                        power_embed.add_field(
-                            name=f"{i}. {team.team_name.strip()}",
-                            value=f"Record: {team.wins}-{team.losses} | Total Pts: {team.points_for:.1f}",
-                            inline=False
-                        )
-                    embeds.append(power_embed)
-                except Exception as e:
-                    print(f"❌ Failed to generate power rankings: {e}")
+        # ✅ FIXED: Ensure this always runs
+        week_embeds.append(embeds)
 
-                week_embeds.append(embeds)
+    if not week_embeds:
+        await ctx.send("❌ No data available. Please check your league setup or ESPN cookies.")
+        return
 
     # === PAGINATION VIEW ===
     class WeekNavigator(View):
@@ -318,12 +326,7 @@ async def weeklyrecap(ctx):
     msg = await ctx.send(embeds=week_embeds[latest_index], view=view)
     view.set_message(msg)
 
-
-    current_week = league.current_week
-    await ctx.send(f"✅ Live data pulled! Current week: {current_week}")
-
 if __name__ == "__main__":
     import asyncio
     token = get_discord_bot_token()
     asyncio.run(bot.start(token))
-
