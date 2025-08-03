@@ -116,34 +116,46 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
 def get_top_weekly_players(league, week, positions, player_img_url, team_img_url, team_logos):
     import discord
 
-    embeds = []
-    players = []
+    top_performers = {pos: {"player": None, "points": -1} for pos in positions}
 
+    # Loop through all teams and players for the week
     for team in league.teams:
         for player in team.roster:
-            if player.stats and isinstance(player.stats.get(week), (int, float)):
-                players.append({
-                    "name": player.name,
-                    "position": player.position,
-                    "points": player.stats[week],
-                    "id": player.playerId
-                })
+            pos = player.position
+            if pos not in top_performers:
+                continue
 
+            week_points = player.stats.get(week)
+            if not isinstance(week_points, (int, float)):
+                continue
+
+            if week_points > top_performers[pos]["points"]:
+                top_performers[pos] = {
+                    "player": player,
+                    "points": week_points
+                }
+
+    embeds = []
     for pos in positions:
-        top = max((p for p in players if p['position'] == pos), key=lambda x: x['points'], default=None)
-        if not top:
+        entry = top_performers[pos]
+        player = entry["player"]
+        points = entry["points"]
+
+        if not player:
             continue
 
+        # Get image URL
         if pos == "D/ST":
-            team_name = top["name"].replace(" D/ST", "").strip()
+            team_name = player.name.replace(" D/ST", "").strip()
             team_code = team_logos.get(team_name)
             image_url = team_img_url.format(code=team_code) if team_code else None
         else:
-            image_url = player_img_url.format(player_id=top["id"])
+            image_url = player_img_url.format(player_id=player.playerId)
 
+        # Build embed
         embed = discord.Embed(
             title=f"Week {week} Top {pos}",
-            description=f"**{top['name']}**\nFantasy Points: **{top['points']:.2f}**",
+            description=f"**{player.name}**\nFantasy Points: **{points:.2f}**",
             color=0x1abc9c
         )
         if image_url:
