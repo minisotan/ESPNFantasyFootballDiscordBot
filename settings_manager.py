@@ -54,5 +54,5 @@ async def set_autopost(guild_id, enabled):
         await db.execute("UPDATE guild_settings SET autopost_enabled = ? WHERE guild_id = ?", (int(enabled), str(guild_id)))
         await db.commit()
 
-async def get_discord_bot_token():
+def get_discord_bot_token():
     return os.environ.get("DISCORD_TOKEN")
