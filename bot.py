@@ -204,8 +204,9 @@ async def weeklyrecap(ctx):
             all_players = []
             for team in league.teams:
                 for player in team.roster:
-                    total = sum(player.stats.values())
-                    avg = total / len(player.stats) if player.stats else 0
+                    points = [v for v in player.stats.values() if isinstance(v, (int, float))]
+                    total = sum(points)
+                    avg = total / len(points) if points else 0
                     all_players.append({
                         "name": player.name,
                         "position": player.position,
