@@ -173,12 +173,14 @@ async def weeklyrecap(ctx):
             for team in league.teams:
                 roster = team.roster
                 for player in roster:
+                    stats = player.get_week_stats(week)
                     if player.stats and week in player.stats:
                         players.append({
                             "name": player.name,
                             "position": player.position,
                             "points": player.stats[week],
-                            "id": player.playerId
+                            "id": player.playerId,
+                            "team": team.team_name
                         })
 
             positions = ['QB', 'RB', 'WR', 'TE', 'K', 'D/ST']
@@ -191,7 +193,7 @@ async def weeklyrecap(ctx):
                     )
                     embed = Embed(
                         title=f"Week {week} Top {pos}",
-                        description=f"**{top['name']}**\nFantasy Points: **{top['points']:.2f}**",
+                        description=f"**{top['name']}**\nFantasy Points: **{top['points']:.2f}**\nTeam: *{top['team']}*",
                         color=0x1abc9c
                     )
                     embed.set_thumbnail(url=image_url)
