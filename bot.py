@@ -144,7 +144,7 @@ async def weeklyrecap(ctx):
         embeds = []
 
         # === HEAD-TO-HEAD MATCHUPS ===
-        try:
+        for game in box_scores:
             box_scores = league.box_scores(week=week)
             matchup_embed = Embed(
                 title=f"Week {week} Head-to-Head Matchups",
@@ -157,19 +157,34 @@ async def weeklyrecap(ctx):
                 home_score = game.home_score
                 away_score = game.away_score
 
-                winner = home if home_score > away_score else away
-                win_score = max(home_score, away_score)
+                home_valid = hasattr(home, "team_name")
+                away_valid = hasattr(away, "team_name")
 
-                result = (
-                    f"{home.team_name} ({home.wins}-{home.losses}) vs. {away.team_name} ({away.wins}-{away.losses})\n"
-                    f"Score: {home_score:.1f} - {away_score:.1f}\n"
-                    f"🏆 Winner: **{winner.team_name}** (**{win_score:.1f}**)"
-                )
+                if home_valid and away_valid:
+                    winner = home if home_score > away_score else away
+                    win_score = max(home_score, away_score)
+
+                    result = (
+                        f"{home.team_name} ({home.wins}-{home.losses}) vs. {away.team_name} ({away.wins}-{away.losses})\n"
+                        f"Score: {home_score:.1f} - {away_score:.1f}\n"
+                        f"🏆 Winner: **{winner.team_name}** (**{win_score:.1f}**)"
+                    )
+                elif home_valid:
+                    result = (
+                        f"{home.team_name} ({home.wins}-{home.losses}) vs. BYE\n"
+                        f"Score: {home_score:.1f} - 0.0\n"
+                        f"🛌 **{home.team_name}** is on a bye week!"
+                    )
+                elif away_valid:
+                    result = (
+                        f"BYE vs. {away.team_name} ({away.wins}-{away.losses})\n"
+                        f"Score: 0.0 - {away_score:.1f}\n"
+                        f"🛌 **{away.team_name}** is on a bye week!"
+                    )
+                else:
+                    continue  # Both teams invalid? Skip.
+
                 matchup_embed.add_field(name="Matchup", value=result, inline=False)
-
-            embeds.append(matchup_embed)
-        except Exception as e:
-            print(f"❌ Failed to fetch box scores for week {week}: {e}")
 
         # === TOP PLAYER PER POSITION THIS WEEK ===
         try:
