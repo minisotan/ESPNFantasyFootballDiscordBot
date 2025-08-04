@@ -144,7 +144,7 @@ async def weeklyrecap(ctx):
         embeds = []
 
         # === HEAD-TO-HEAD MATCHUPS ===
-        for game in box_scores:
+        try:
             box_scores = league.box_scores(week=week)
             matchup_embed = Embed(
                 title=f"Week {week} Head-to-Head Matchups",
@@ -185,6 +185,9 @@ async def weeklyrecap(ctx):
                     continue  # Both teams invalid? Skip.
 
                 matchup_embed.add_field(name="Matchup", value=result, inline=False)
+            embeds.append(matchup_embed)
+        except Exception as e:
+            print(f"❌ Failed to fetch box scores for week {week}: {e}")
 
         # === TOP PLAYER PER POSITION THIS WEEK ===
         try:
