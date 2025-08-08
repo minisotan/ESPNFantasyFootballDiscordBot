@@ -387,38 +387,87 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True, ephemeral=True)
     try:
         settings = await get_guild_settings(str(interaction.guild.id))
-        # prefer configured channel; fallback to where the command was used
-        channel = interaction.guild.get_channel(int(settings["channel_id"])) if settings and settings.get("channel_id") else interaction.channel
-
-        perms = channel.permissions_for(interaction.guild.me)
-        if not perms.send_messages or not perms.embed_links:
-            await interaction.followup.send(f"❌ I don’t have permission to post embeds in {channel.mention}.", ephemeral=True)
-            return
-
-        # Build league and all pages
         if not settings:
             await interaction.followup.send("❌ This server hasn't been set up. Use `/setup` first.", ephemeral=True)
             return
 
-        league = build_league_from_settings(settings)
-        current_week = int(getattr(league, "current_week", 1) or 1)
+        # Prefer configured channel; fallback to where the command was used
+        channel = (
+            interaction.guild.get_channel(int(settings["channel_id"]))
+            if settings.get("channel_id") else interaction.channel
+        )
 
-        # Build pages (one page = embeds for a single week, in your requested order)
+        # Permission check
+        perms = channel.permissions_for(interaction.guild.me)
+        if not perms.send_messages or not perms.embed_links:
+            await interaction.followup.send(
+                f"❌ I don’t have permission to post embeds in {channel.mention}.",
+                ephemeral=True
+            )
+            return
+
+        # Build league + robust current week
+        league = build_league_from_settings(settings)
+        current_week = (
+            int(getattr(league, "current_week", 0) or 0)
+            or int(getattr(league, "nfl_week", 0) or 0)
+            or 1
+        )
+        if current_week < 1:
+            current_week = 1  # defensive
+
+        # Build pages (one page per week) in your requested order
         week_pages: list[list[discord.Embed]] = []
         for wk in range(1, current_week + 1):
-            page = await build_week_page(league, wk)
-            week_pages.append(page)
+            try:
+                page = await build_week_page(league, wk)
+                if page:  # only append non-empty pages
+                    week_pages.append(page)
+            except Exception as inner_e:
+                print(f"⚠️ Skipping week {wk} due to error: {inner_e}")
 
-        # Send first page with navigator
+        # If nothing was built (preseason/empty data), try week 1 once
+        if not week_pages:
+            try:
+                fallback = await build_week_page(league, 1)
+                if fallback:
+                    week_pages.append(fallback)
+            except Exception as fe:
+                print(f"⚠️ Fallback week 1 failed: {fe}")
+
+        if not week_pages:
+            await interaction.followup.send("🤷 I couldn’t find any data to post yet.", ephemeral=True)
+            return
+
+        # Send latest week with navigator
         view = WeekNavigator(week_pages)
-        first_page = week_pages[-1] if week_pages else []
+        first_page = week_pages[-1]
+        # Extra guard: if somehow empty, post a tiny “no data” embed
+        if not first_page:
+            first_page = [Embed(title="No data yet", description="Try again later.", color=0x95a5a6)]
+
         message = await channel.send(embeds=first_page, view=view)
         view.set_message(message)
 
-        await interaction.followup.send(f"✅ Weekly recap posted in {channel.mention} with week navigation.", ephemeral=True)
+        await interaction.followup.send(
+            f"✅ Weekly recap posted in {channel.mention} with week navigation (current week: {current_week}).",
+            ephemeral=True
+        )
 
     except Exception as e:
         await interaction.followup.send(f"❌ Error while posting: `{e}`", ephemeral=True)
+
+@bot.tree.command(name="debug_week", description="Show detected current week values")
+async def debug_week(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    settings = await get_guild_settings(str(interaction.guild.id))
+    if not settings:
+        await interaction.followup.send("No settings found.", ephemeral=True)
+        return
+    league = build_league_from_settings(settings)
+    cw = getattr(league, "current_week", None)
+    nw = getattr(league, "nfl_week", None)
+    await interaction.followup.send(f"current_week={cw!r}, nfl_week={nw!r}", ephemeral=True)
 
 # ---------- Scheduler (auto-post Tuesdays 11:00 AM ET) ----------
 @scheduler.scheduled_job("cron", day_of_week="tue", hour=11, minute=0)
