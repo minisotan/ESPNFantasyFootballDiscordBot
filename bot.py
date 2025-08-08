@@ -103,10 +103,72 @@ async def send_weekly_recap_to_channel(guild: discord.Guild, channel: discord.ab
     except Exception as e:
         print(f"❌ Failed season top5 through w{week}: {e}")
 
-    if embeds:
-        await channel.send(embeds=embeds)
-    else:
+        # === POWER RANKINGS ===
+    try:
+        teams = sorted(
+            league.teams,
+            key=lambda t: (
+                -(getattr(t, "wins", 0) or 0),
+                -float(getattr(t, "points_for", 0) or 0.0),
+            ),
+        )
+        pr = discord.Embed(
+            title="📊 Power Rankings",
+            description="Sorted by Wins, then Points For",
+            color=0x2980b9,
+        )
+        for i, team in enumerate(teams, 1):
+            pr.add_field(
+                name=f"{i}. {team.team_name.strip()}",
+                value=(
+                    f"Record: {getattr(team, 'wins', 0)}-{getattr(team, 'losses', 0)} | "
+                    f"PF: {float(getattr(team, 'points_for', 0) or 0):.1f} | "
+                    f"PA: {float(getattr(team, 'points_against', 0) or 0):.1f}"
+                ),
+                inline=False,
+            )
+        embeds.append(pr)
+    except Exception as e:
+        print(f"❌ Failed power rankings: {e}")
+
+    def chunk(lst, n):
+        for i in range(0, len(lst), n):
+            yield lst[i:i+n]
+
+    if not embeds:
         await channel.send(f"🤷 No data available for week {week} yet.")
+    else:
+        for batch in chunk(embeds, 10):  # Discord max 10 embeds per message
+            await channel.send(embeds=batch)
+
+
+        # Power Rankings
+    try:
+        teams = sorted(
+            league.teams,
+            key=lambda t: (
+                -(getattr(t, "wins", 0) or 0),
+                -float(getattr(t, "points_for", 0) or 0.0),
+            ),
+        )
+        pr = discord.Embed(
+            title="📊 Power Rankings",
+            description="Sorted by Wins, then Points For",
+            color=0x2980b9,
+        )
+        for i, team in enumerate(teams, 1):
+            pr.add_field(
+                name=f"{i}. {team.team_name.strip()}",
+                value=(
+                    f"Record: {getattr(team, 'wins', 0)}-{getattr(team, 'losses', 0)} | "
+                    f"PF: {float(getattr(team, 'points_for', 0) or 0):.1f} | "
+                    f"PA: {float(getattr(team, 'points_against', 0) or 0):.1f}"
+                ),
+                inline=False,
+            )
+        embeds.append(pr)
+    except Exception as e:
+        print(f"❌ Failed power rankings: {e}")
 
 
 # ---------- Discord setup ----------
