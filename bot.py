@@ -98,9 +98,8 @@ async def send_weekly_recap_to_channel(guild: discord.Guild, channel: discord.ab
 
     # Season top-5
     try:
-        season_top_embeds = await build_season_top_embeds(league, int(week))
-        pad_embeds(season_top_embeds)
-        embeds.extend(season_top_embeds)
+        season_top_embeds = await build_season_top_embed_combined(league, int(week))
+        embeds.append(season_top_embeds)
     except Exception as e:
         print(f"❌ Failed season top5 through w{week}: {e}")
 
@@ -226,13 +225,12 @@ async def build_weekly_top_embeds(league: League, week: int, starters_only: bool
     return embeds
 
 
-async def build_season_top_embeds(league: League, current_week: int, starters_only: bool = False) -> list[discord.Embed]:
-    """Top 5 per position through current_week using box scores for stability."""
-    season_points: dict[str, dict[str, float]] = {p: {} for p in DESIRED_POSITIONS}
+async def build_season_top_embed_combined(league, current_week: int, starters_only: bool = False) -> discord.Embed:
+    desired = ['QB', 'RB', 'WR', 'TE', 'K', 'D/ST']
+    season_points = {p: {} for p in desired}
 
     for wk in range(1, current_week + 1):
-        week_boxes = league.box_scores(week=wk)
-        for game in week_boxes:
+        for game in league.box_scores(week=wk):
             for lineup in (game.home_lineup, game.away_lineup):
                 for bp in lineup:
                     pts = getattr(bp, "points", None)
@@ -243,20 +241,22 @@ async def build_season_top_embeds(league: League, current_week: int, starters_on
                     if starters_only and slot == "BE":
                         continue
                     pos = "D/ST" if pos in ("DST", "DEF", "Def") else pos
-                    if pos not in DESIRED_POSITIONS:
+                    if pos not in season_points:
                         continue
                     season_points[pos][bp.name] = season_points[pos].get(bp.name, 0.0) + float(pts)
 
-    embeds: list[discord.Embed] = []
-    for pos in DESIRED_POSITIONS:
+    lines = []
+    for pos in desired:
         top5 = sorted(season_points[pos].items(), key=lambda x: x[1], reverse=True)[:5]
-        desc = "\n".join(f"**{name}** — {pts:.2f}" for name, pts in top5) if top5 else "No data."
-        embeds.append(Embed(
-            title=f"Season Top 5 {pos}s",
-            description=desc,
-            color=0xe67e22
-        ))
-    return embeds
+        section = "\n".join(f"• **{name}** — {pts:.2f}" for name, pts in top5) if top5 else "_No data_"
+        lines.append(f"**{pos}**\n{section}")
+
+    return discord.Embed(
+        title=f"Season Top 5 (through Week {current_week})",
+        description="\n\n".join(lines),
+        color=0xe67e22
+    )
+
 
 
 # ---------- Paginator (Week Navigator) ----------
@@ -506,9 +506,8 @@ async def send_weekly_recap(ctx: commands.Context):
 
     # === TOP 5 PER POSITION (SEASON TOTALS THROUGH CURRENT WEEK) ===
     try:
-        season_top_embeds = await build_season_top_embeds(league, week)
-        pad_embeds(season_top_embeds)
-        embeds.extend(season_top_embeds)
+        season_top_embeds = await build_season_top_embed_combined(league, week)
+        embeds.append(season_top_embeds)
     except Exception as e:
         print(f"❌ Failed to generate top 5 players: {e}")
 
