@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands
 from discord.ui import Button, View
 from discord import app_commands
+from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from espn_api.football import League
 from settings_manager import (
@@ -15,7 +16,7 @@ from settings_manager import (
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
-scheduler = AsyncIOScheduler()
+scheduler = AsyncIOScheduler(timezone=ZoneInfo("America/New_York"))
 
 PLAYER_IMG = "https://a.espncdn.com/i/headshots/nfl/players/full/{player_id}.png"
 TEAM_IMG = "https://a.espncdn.com/i/teamlogos/nfl/500/{code}.png"
@@ -36,7 +37,7 @@ async def on_ready():
     scheduler.start()
     print(f"✅ Logged in as {bot.user}")
 
-@scheduler.scheduled_job("cron", day_of_week="tue", hour=15, minute=0)
+@scheduler.scheduled_job("cron", day_of_week="tue", hour=11, minute=0)
 async def auto_post_weekly_recap():
     for guild in bot.guilds:
         settings = await get_guild_settings(str(guild.id))
@@ -102,7 +103,11 @@ async def autopost(interaction: discord.Interaction, enabled: bool):
         return
 
     await set_autopost(str(interaction.guild.id), enabled)
-    msg = "✅ Auto-posting enabled! Weekly recaps will post Tuesdays at 11:00 AM EST." if enabled else "❌ Auto-posting disabled."
+    msg = (
+        "✅ Auto-posting enabled. Weekly recaps will be posted every Tuesday at 11 AM ET."
+        if enabled else
+       "❌ Auto-posting disabled."
+        )
     await interaction.response.send_message(msg, ephemeral=True)
 
 @bot.tree.command(name="weeklyrecap", description="Manually trigger a weekly recap")
@@ -189,79 +194,77 @@ async def weeklyrecap(ctx):
         except Exception as e:
             print(f"❌ Failed to fetch box scores for week {week}: {e}")
 
-        # === TOP PLAYER PER POSITION THIS WEEK ===
+  # === TOP PLAYER PER POSITION THIS WEEK ===
         try:
-            players = []
-            for team in league.teams:
-                for player in team.roster:
-                    stats = player.stats.get(week)
-                    if stats and isinstance(stats, dict) and 'points' in stats:
-                        players.append({
-                            "name": player.name,
-                            "position": player.position,
-                            "points": stats['points'],
-                            "id": player.playerId,
-                            "team": team.team_name
-                        })
+            desired_positions = ['QB', 'RB', 'WR', 'TE', 'K', 'D/ST']
+            best = {p: None for p in desired_positions}
 
-            positions = ['QB', 'RB', 'WR', 'TE', 'K', 'D/ST']
-            for pos in positions:
-                top = max((p for p in players if p['position'] == pos), key=lambda x: x['points'], default=None)
-                if top:
-                    image_url = (
-                        TEAM_IMG.format(code=TEAM_LOGO.get(top['name'].replace(" D/ST", ""), ""))
-                        if pos == "D/ST" else PLAYER_IMG.format(player_id=top['id'])
-                    )
-                    embed = discord.Embed(
-                        title=f"Week {week} Top {pos}",
-                        description=(
-                            f"**{top['name']}**\n"
-                            f"Fantasy Points: **{top['points']:.2f}**\n"
-                            f"Team: *{top['team']}*"
-                        ),
-                        color=0x1abc9c
-                    )
+            # Use box scores for the exact week's points and team mapping.
+            week_boxes = league.box_scores(week=week)
+
+            for game in week_boxes:
+                # Pair each lineup with its fantasy team
+                for lineup, fteam in ((game.home_lineup, game.home_team), (game.away_lineup, game.away_team)):
+                    for bp in lineup:
+                        # bp: BoxScorePlayer
+                        pts = getattr(bp, "points", None)
+                        base_pos = getattr(bp, "position", None)  # True NFL position (e.g., 'RB')
+                        slot_pos = getattr(bp, "slot_position", None)  # Roster slot (e.g., 'FLEX', 'BE')
+
+                        if pts is None or base_pos is None:
+                            continue
+
+                        # Normalize D/ST names/position
+                        pos = base_pos
+                        if pos in ("DST", "DEF", "Def"):
+                            pos = "D/ST"
+
+                        # If the pos isn't directly one of our targets, try to resolve (e.g., FLEX -> base_pos)
+                        if pos not in desired_positions:
+                            if base_pos in desired_positions:
+                                pos = base_pos
+                            else:
+                                continue
+
+                        current = best.get(pos)
+                        if current is None or float(pts) > current["points"]:
+                            best[pos] = {
+                                "name": bp.name,
+                                "points": float(pts),
+                                "id": getattr(bp, "playerId", None),
+                                "team": getattr(fteam, "team_name", "Unknown")
+                            }
+
+            # Emit embeds for each position
+            for pos in desired_positions:
+                top = best.get(pos)
+                if not top:
+                    continue
+
+                # Build image URL
+                if pos == "D/ST":
+                    # Name like "Patriots D/ST" -> "Patriots"
+                    team_key = top["name"].replace(" D/ST", "").strip()
+                    code = TEAM_LOGO.get(team_key)
+                    image_url = TEAM_IMG.format(code=code) if code else None
+                else:
+                    image_url = PLAYER_IMG.format(player_id=top["id"]) if top["id"] else None
+
+                embed = discord.Embed(
+                    title=f"Week {week} Top {pos}",
+                    description=(
+                        f"**{top['name']}** ({pos})\n"
+                        f"Fantasy Points: **{top['points']:.2f}**\n"
+                        f"Fantasy Team: *{top['team']}*"
+                    ),
+                    color=0x1abc9c
+                )
+                if image_url:
                     embed.set_thumbnail(url=image_url)
-                    embeds.append(embed)
+                embeds.append(embed)
+
         except Exception as e:
             print(f"❌ Failed to generate top players for week {week}: {e}")
-
-        # === TOP 5 PLAYERS PER POSITION (SEASON TOTAL) ===
-        try:
-            all_players = []
-            for team in league.teams:
-                for player in team.roster:
-                    total = sum(week.get('points', 0) for week in player.stats.values() if isinstance(week, dict))
-                    valid_weeks = [week for week in player.stats.values() if isinstance(week, dict) and 'points' in week]
-                    avg = total / len(valid_weeks) if valid_weeks else 0
-                    all_players.append({
-                        "name": player.name,
-                        "position": player.position,
-                        "total": total,
-                        "avg": avg
-                    })
-
-            top_embed = discord.Embed(
-                title="🏅 Season Top 5 by Position",
-                description="Sorted by total points",
-                color=0x9b59b6
-            )
-
-            for pos in ['QB', 'RB', 'WR', 'TE', 'K', 'D/ST']:
-                top5 = sorted(
-                    (p for p in all_players if p['position'] == pos),
-                    key=lambda x: x['total'],
-                    reverse=True
-                )[:5]
-                field = "\n".join(
-                    f"{i+1}. {p['name']} — {p['total']:.1f} pts (Avg: {p['avg']:.1f})"
-                    for i, p in enumerate(top5)
-                )
-                top_embed.add_field(name=f"Top 5 {pos}s", value=field or "No data", inline=False)
-
-            embeds.append(top_embed)
-        except Exception as e:
-            print(f"❌ Failed to generate top 5 players: {e}")
 
         # === POWER RANKINGS ===
         try:
@@ -307,8 +310,8 @@ async def weeklyrecap(ctx):
             self.update_button_states()
 
         def update_button_states(self):
-            self.children[0].disabled = (self.index == 0)
-            self.children[1].disabled = (self.index == len(self.week_embeds) - 1)
+            self.previous.disabled = (self.index == 0)
+            self.next.disabled = (self.index == len(self.week_embeds) - 1)
 
         @discord.ui.button(label="⬅️", style=discord.ButtonStyle.primary)
         async def previous(self, interaction: discord.Interaction, button: Button):
