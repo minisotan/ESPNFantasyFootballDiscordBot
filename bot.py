@@ -16,160 +16,86 @@ from settings_manager import (
     init_db
 )
 
-async def send_weekly_recap_to_channel(guild: discord.Guild, channel: discord.abc.Messageable):
-    """Builds all recap embeds and sends them to the given channel."""
-    # Ensure channel is messageable and we have perms
-    try:
-        perms = channel.permissions_for(guild.me)
-        if not perms.send_messages:
-            await channel.send  # just to force attribute access for typing; no-op
-    except Exception:
-        # Fallback: try configured channel if passed channel isn't usable
-        settings = await get_guild_settings(str(guild.id))
-        if settings and settings.get("channel_id"):
-            fallback = guild.get_channel(int(settings["channel_id"]))
-            if fallback and fallback != channel:
-                channel = fallback
-    settings = await get_guild_settings(str(guild.id))
-    if not settings:
-        await channel.send("❌ This server hasn't been set up. Use `/setup` first.")
-        return
+# --- New/updated embed builders to control order ---
 
-    try:
-        league = build_league_from_settings(settings)
-    except Exception as e:
-        await channel.send(f"❌ Failed to initialize ESPN League: {e}")
-        return
+def build_head_to_head_embed(league, week: int) -> discord.Embed:
+    box_scores = league.box_scores(week=week)
+    e = Embed(
+        title=f"Week {week} Head-to-Head Matchups",
+        description="🏈 Weekly fantasy results",
+        color=0xf39c12
+    )
+    for game in box_scores:
+        home, away = game.home_team, game.away_team
+        hs, as_ = game.home_score, game.away_score
+        hv, av = hasattr(home, "team_name"), hasattr(away, "team_name")
+        if hv and av:
+            winner = home if hs > as_ else away
+            win_score = max(hs, as_)
+            result = (
+                f"{home.team_name} ({home.wins}-{home.losses}) vs. {away.team_name} ({away.wins}-{away.losses})\n"
+                f"Score: {hs:.1f} - {as_:.1f}\n"
+                f"🏆 Winner: **{winner.team_name}** (**{win_score:.1f}**)"
+            )
+        elif hv:
+            result = (
+                f"{home.team_name} ({home.wins}-{home.losses}) vs. BYE\n"
+                f"Score: {hs:.1f} - 0.0\n"
+                f"🛌 **{home.team_name}** is on a bye week!"
+            )
+        elif av:
+            result = (
+                f"BYE vs. {away.team_name} ({away.wins}-{away.losses})\n"
+                f"Score: 0.0 - {as_:.1f}\n"
+                f"🛌 **{away.team_name}** is on a bye week!"
+            )
+        else:
+            continue
+        e.add_field(name="Matchup", value=result, inline=False)
+    return e
 
-    # Pick a week (fallback-safe)
-    week = getattr(league, "current_week", None) or getattr(league, "nfl_week", None) or 1
+def build_power_rankings_embed(league) -> discord.Embed:
+    teams = sorted(
+        league.teams,
+        key=lambda t: (-(getattr(t, "wins", 0) or 0), -float(getattr(t, "points_for", 0) or 0.0))
+    )
+    e = Embed(title="📊 Power Rankings", description="Sorted by Wins, then Points For", color=0x2980b9)
+    for i, team in enumerate(teams, 1):
+        e.add_field(
+            name=f"{i}. {team.team_name.strip()}",
+            value=(
+                f"Record: {getattr(team, 'wins', 0)}-{getattr(team, 'losses', 0)} | "
+                f"PF: {float(getattr(team, 'points_for', 0) or 0):.1f} | "
+                f"PA: {float(getattr(team, 'points_against', 0) or 0):.1f}"
+            ),
+            inline=False,
+        )
+    return e
 
+
+async def build_week_page(league, week: int) -> list[discord.Embed]:
+    """Return embeds for ONE week in the requested order:
+       1) Head-to-head, 2) Weekly top players, 3) Season top-5 (combined), 4) Power rankings.
+       Guaranteed ≤ 10 embeds."""
     embeds: list[discord.Embed] = []
 
-    # Weekly top players
-    try:
-        weekly_top_embeds = await build_weekly_top_embeds(league, int(week))
-        pad_embeds(weekly_top_embeds)
-        embeds.extend(weekly_top_embeds)
-    except Exception as e:
-        print(f"❌ Failed weekly tops w{week}: {e}")
+    # 1) Head-to-Head FIRST
+    embeds.append(build_head_to_head_embed(league, week))
 
-    # Head-to-head
-    try:
-        box_scores = league.box_scores(week=int(week))
-        matchup_embed = Embed(
-            title=f"Week {week} Head-to-Head Matchups",
-            description="🏈 Weekly fantasy results",
-            color=0xf39c12
-        )
-        for game in box_scores:
-            home, away = game.home_team, game.away_team
-            hs, as_ = game.home_score, game.away_score
-            hv, av = hasattr(home, "team_name"), hasattr(away, "team_name")
+    # 2) Weekly Top Players (pad to align)
+    weekly_top_embeds = await build_weekly_top_embeds(league, week)
+    pad_embeds(weekly_top_embeds)
+    embeds.extend(weekly_top_embeds)
 
-            if hv and av:
-                winner = home if hs > as_ else away
-                win_score = max(hs, as_)
-                result = (
-                    f"{home.team_name} ({home.wins}-{home.losses}) vs. {away.team_name} ({away.wins}-{away.losses})\n"
-                    f"Score: {hs:.1f} - {as_:.1f}\n"
-                    f"🏆 Winner: **{winner.team_name}** (**{win_score:.1f}**)"
-                )
-            elif hv:
-                result = (
-                    f"{home.team_name} ({home.wins}-{home.losses}) vs. BYE\n"
-                    f"Score: {hs:.1f} - 0.0\n"
-                    f"🛌 **{home.team_name}** is on a bye week!"
-                )
-            elif av:
-                result = (
-                    f"BYE vs. {away.team_name} ({away.wins}-{away.losses})\n"
-                    f"Score: 0.0 - {as_:.1f}\n"
-                    f"🛌 **{away.team_name}** is on a bye week!"
-                )
-            else:
-                continue
+    # 3) Season Top-5 (combined single embed) THROUGH selected week
+    season_top_embed = await build_season_top_embed_combined(league, week)
+    embeds.append(season_top_embed)
 
-            matchup_embed.add_field(name="Matchup", value=result, inline=False)
+    # 4) Power Rankings
+    embeds.append(build_power_rankings_embed(league))
 
-        embeds.append(matchup_embed)
-    except Exception as e:
-        print(f"❌ Failed H2H w{week}: {e}")
-
-    # Season top-5
-    try:
-        season_top_embeds = await build_season_top_embed_combined(league, int(week))
-        embeds.append(season_top_embeds)
-    except Exception as e:
-        print(f"❌ Failed season top5 through w{week}: {e}")
-
-        # === POWER RANKINGS ===
-    try:
-        teams = sorted(
-            league.teams,
-            key=lambda t: (
-                -(getattr(t, "wins", 0) or 0),
-                -float(getattr(t, "points_for", 0) or 0.0),
-            ),
-        )
-        pr = discord.Embed(
-            title="📊 Power Rankings",
-            description="Sorted by Wins, then Points For",
-            color=0x2980b9,
-        )
-        for i, team in enumerate(teams, 1):
-            pr.add_field(
-                name=f"{i}. {team.team_name.strip()}",
-                value=(
-                    f"Record: {getattr(team, 'wins', 0)}-{getattr(team, 'losses', 0)} | "
-                    f"PF: {float(getattr(team, 'points_for', 0) or 0):.1f} | "
-                    f"PA: {float(getattr(team, 'points_against', 0) or 0):.1f}"
-                ),
-                inline=False,
-            )
-        embeds.append(pr)
-    except Exception as e:
-        print(f"❌ Failed power rankings: {e}")
-
-    def chunk(lst, n):
-        for i in range(0, len(lst), n):
-            yield lst[i:i+n]
-
-    if not embeds:
-        await channel.send(f"🤷 No data available for week {week} yet.")
-    else:
-        for batch in chunk(embeds, 10):  # Discord max 10 embeds per message
-            await channel.send(embeds=batch)
-
-
-        # Power Rankings
-    try:
-        teams = sorted(
-            league.teams,
-            key=lambda t: (
-                -(getattr(t, "wins", 0) or 0),
-                -float(getattr(t, "points_for", 0) or 0.0),
-            ),
-        )
-        pr = discord.Embed(
-            title="📊 Power Rankings",
-            description="Sorted by Wins, then Points For",
-            color=0x2980b9,
-        )
-        for i, team in enumerate(teams, 1):
-            pr.add_field(
-                name=f"{i}. {team.team_name.strip()}",
-                value=(
-                    f"Record: {getattr(team, 'wins', 0)}-{getattr(team, 'losses', 0)} | "
-                    f"PF: {float(getattr(team, 'points_for', 0) or 0):.1f} | "
-                    f"PA: {float(getattr(team, 'points_against', 0) or 0):.1f}"
-                ),
-                inline=False,
-            )
-        embeds.append(pr)
-    except Exception as e:
-        print(f"❌ Failed power rankings: {e}")
-
+    # Defensive: Discord max 10
+    return embeds[:10]
 
 # ---------- Discord setup ----------
 intents = discord.Intents.default()
@@ -321,15 +247,14 @@ async def build_season_top_embed_combined(league, current_week: int, starters_on
 
 
 
-# ---------- Paginator (Week Navigator) ----------
 class WeekNavigator(View):
     def __init__(self, week_embeds: list[list[discord.Embed]]):
         super().__init__(timeout=300)
-        self.week_embeds = week_embeds  # list of lists (embeds per week page)
+        self.week_embeds = week_embeds
         self.index = len(week_embeds) - 1
         self.message: discord.Message | None = None
 
-        # Select for quick week jump
+        # Dropdown weeks
         options = [discord.SelectOption(label=f"Week {i+1}", value=str(i)) for i in range(len(week_embeds))]
         self.select = Select(placeholder="Jump to week…", min_values=1, max_values=1, options=options)
         self.select.callback = self.jump_to_week
@@ -339,8 +264,6 @@ class WeekNavigator(View):
         self.message = message
 
     def update_button_states(self):
-        # FIX: toggle the button attributes, not children indices
-        # These attributes are set by the @discord.ui.button decorators below
         self.previous.disabled = (self.index == 0)
         self.next.disabled = (self.index == len(self.week_embeds) - 1)
 
@@ -372,7 +295,6 @@ class WeekNavigator(View):
         self.index = int(self.select.values[0])
         self.update_button_states()
         await self.message.edit(embeds=self.week_embeds[self.index], view=self)
-
 
 # ---------- Commands ----------
 @bot.event
@@ -464,118 +386,39 @@ async def autopost(interaction: discord.Interaction, enabled: bool):
 async def weeklyrecap_slash(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True, ephemeral=True)
     try:
-        # Prefer configured channel; fallback to the channel where the command was used
         settings = await get_guild_settings(str(interaction.guild.id))
-        channel = None
-        if settings and settings.get("channel_id"):
-            channel = interaction.guild.get_channel(int(settings["channel_id"]))
-        if channel is None:
-            channel = interaction.channel
+        # prefer configured channel; fallback to where the command was used
+        channel = interaction.guild.get_channel(int(settings["channel_id"])) if settings and settings.get("channel_id") else interaction.channel
 
-        # Permission check (send + embeds)
         perms = channel.permissions_for(interaction.guild.me)
-        if not perms.send_messages:
-            await interaction.followup.send(f"❌ I can’t send messages in {channel.mention}. Give me **Send Messages**.", ephemeral=True)
-            return
-        if not perms.embed_links:
-            await interaction.followup.send(f"❌ I can’t send embeds in {channel.mention}. Give me **Embed Links**.", ephemeral=True)
+        if not perms.send_messages or not perms.embed_links:
+            await interaction.followup.send(f"❌ I don’t have permission to post embeds in {channel.mention}.", ephemeral=True)
             return
 
-        await send_weekly_recap_to_channel(interaction.guild, channel)
-        await interaction.followup.send(f"✅ Weekly recap posted in {channel.mention}", ephemeral=True)
+        # Build league and all pages
+        if not settings:
+            await interaction.followup.send("❌ This server hasn't been set up. Use `/setup` first.", ephemeral=True)
+            return
 
-    except Exception as e:
-        # Always tell you what went wrong instead of failing silently
-        await interaction.followup.send(f"❌ Error while posting: `{e}`", ephemeral=True)
-
-
-# ---------- Weekly recap core ----------
-async def send_weekly_recap(ctx: commands.Context):
-    guild_id = str(ctx.guild.id)
-    settings = await get_guild_settings(guild_id)
-    if not settings:
-        await ctx.send("❌ This server hasn't been set up. Use `/setup` first.")
-        return
-
-    try:
         league = build_league_from_settings(settings)
+        current_week = int(getattr(league, "current_week", 1) or 1)
+
+        # Build pages (one page = embeds for a single week, in your requested order)
+        week_pages: list[list[discord.Embed]] = []
+        for wk in range(1, current_week + 1):
+            page = await build_week_page(league, wk)
+            week_pages.append(page)
+
+        # Send first page with navigator
+        view = WeekNavigator(week_pages)
+        first_page = week_pages[-1] if week_pages else []
+        message = await channel.send(embeds=first_page, view=view)
+        view.set_message(message)
+
+        await interaction.followup.send(f"✅ Weekly recap posted in {channel.mention} with week navigation.", ephemeral=True)
+
     except Exception as e:
-        await ctx.send(f"❌ Failed to initialize ESPN League: {e}")
-        return
-
-    # Decide target week: ESPN's current_week is commonly available as league.current_week
-    try:
-        week = int(league.current_week)
-    except Exception:
-        # Fallback
-        week = 1
-
-    embeds: list[discord.Embed] = []
-
-    # === TOP PLAYERS PER POSITION (WEEKLY) ===
-    try:
-        weekly_top_embeds = await build_weekly_top_embeds(league, week)
-        pad_embeds(weekly_top_embeds)
-        embeds.extend(weekly_top_embeds)
-    except Exception as e:
-        print(f"❌ Failed to generate weekly top players for week {week}: {e}")
-
-    # === HEAD-TO-HEAD MATCHUPS ===
-    try:
-        box_scores = league.box_scores(week=week)
-        matchup_embed = Embed(
-            title=f"Week {week} Head-to-Head Matchups",
-            description="🏈 Weekly fantasy results",
-            color=0xf39c12
-        )
-        for game in box_scores:
-            home = game.home_team
-            away = game.away_team
-            home_score = game.home_score
-            away_score = game.away_score
-
-            home_valid = hasattr(home, "team_name")
-            away_valid = hasattr(away, "team_name")
-
-            if home_valid and away_valid:
-                winner = home if home_score > away_score else away
-                win_score = max(home_score, away_score)
-                result = (
-                    f"{home.team_name} ({home.wins}-{home.losses}) vs. {away.team_name} ({away.wins}-{away.losses})\n"
-                    f"Score: {home_score:.1f} - {away_score:.1f}\n"
-                    f"🏆 Winner: **{winner.team_name}** (**{win_score:.1f}**)"
-                )
-            elif home_valid:
-                result = (
-                    f"{home.team_name} ({home.wins}-{home.losses}) vs. BYE\n"
-                    f"Score: {home_score:.1f} - 0.0\n"
-                    f"🛌 **{home.team_name}** is on a bye week!"
-                )
-            elif away_valid:
-                result = (
-                    f"BYE vs. {away.team_name} ({away.wins}-{away.losses})\n"
-                    f"Score: 0.0 - {away_score:.1f}\n"
-                    f"🛌 **{away.team_name}** is on a bye week!"
-                )
-            else:
-                continue
-
-            matchup_embed.add_field(name="Matchup", value=result, inline=False)
-
-        embeds.append(matchup_embed)
-    except Exception as e:
-        print(f"❌ Failed to fetch box scores for week {week}: {e}")
-
-    # === TOP 5 PER POSITION (SEASON TOTALS THROUGH CURRENT WEEK) ===
-    try:
-        season_top_embeds = await build_season_top_embed_combined(league, week)
-        embeds.append(season_top_embeds)
-    except Exception as e:
-        print(f"❌ Failed to generate top 5 players: {e}")
-
-    # Paginated weeks (if you store per-week pages). For now, just send a single page with all embeds:
-    await ctx.send(embeds=embeds)
-
+        await interaction.followup.send(f"❌ Error while posting: `{e}`", ephemeral=True)
 
 # ---------- Scheduler (auto-post Tuesdays 11:00 AM ET) ----------
 @scheduler.scheduled_job("cron", day_of_week="tue", hour=11, minute=0)
@@ -583,18 +426,26 @@ async def auto_post_weekly_recap():
     for guild in bot.guilds:
         try:
             settings = await get_guild_settings(str(guild.id))
-            if not settings or not settings.get("autopost_enabled"):
+            if not settings or not settings.get("autopost_enabled") or not settings.get("channel_id"):
                 continue
-            channel_id = settings.get("channel_id")
-            if not channel_id:
-                continue
-            channel = guild.get_channel(int(channel_id))
+
+            channel = guild.get_channel(int(settings["channel_id"]))
             if not isinstance(channel, (discord.TextChannel, discord.Thread)):
                 continue
-            await send_weekly_recap_to_channel(guild, channel)
+
+            # Build league + current week
+            league = build_league_from_settings(settings)
+            week = int(getattr(league, "current_week", 1) or 1)
+
+            # Build the single-page (≤10 embeds) for the current week
+            page = await build_week_page(league, week)
+            if not page:
+                await channel.send(f"🤷 No data available for week {week} yet.")
+            else:
+                await channel.send(embeds=page)
+
         except Exception as e:
             print(f"❌ Auto-post failed for guild {guild.id}: {e}")
-
 
 # ---------- Entrypoint ----------
 if __name__ == "__main__":
