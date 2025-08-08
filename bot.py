@@ -16,6 +16,88 @@ from settings_manager import (
     init_db
 )
 
+async def send_weekly_recap_to_channel(guild: discord.Guild, channel: discord.abc.Messageable):
+    """Builds all recap embeds and sends them to the given channel."""
+    settings = await get_guild_settings(str(guild.id))
+    if not settings:
+        await channel.send("❌ This server hasn't been set up. Use `/setup` first.")
+        return
+
+    try:
+        league = build_league_from_settings(settings)
+    except Exception as e:
+        await channel.send(f"❌ Failed to initialize ESPN League: {e}")
+        return
+
+    # Pick a week (fallback-safe)
+    week = getattr(league, "current_week", None) or getattr(league, "nfl_week", None) or 1
+
+    embeds: list[discord.Embed] = []
+
+    # Weekly top players
+    try:
+        weekly_top_embeds = await build_weekly_top_embeds(league, int(week))
+        pad_embeds(weekly_top_embeds)
+        embeds.extend(weekly_top_embeds)
+    except Exception as e:
+        print(f"❌ Failed weekly tops w{week}: {e}")
+
+    # Head-to-head
+    try:
+        box_scores = league.box_scores(week=int(week))
+        matchup_embed = Embed(
+            title=f"Week {week} Head-to-Head Matchups",
+            description="🏈 Weekly fantasy results",
+            color=0xf39c12
+        )
+        for game in box_scores:
+            home, away = game.home_team, game.away_team
+            hs, as_ = game.home_score, game.away_score
+            hv, av = hasattr(home, "team_name"), hasattr(away, "team_name")
+
+            if hv and av:
+                winner = home if hs > as_ else away
+                win_score = max(hs, as_)
+                result = (
+                    f"{home.team_name} ({home.wins}-{home.losses}) vs. {away.team_name} ({away.wins}-{away.losses})\n"
+                    f"Score: {hs:.1f} - {as_:.1f}\n"
+                    f"🏆 Winner: **{winner.team_name}** (**{win_score:.1f}**)"
+                )
+            elif hv:
+                result = (
+                    f"{home.team_name} ({home.wins}-{home.losses}) vs. BYE\n"
+                    f"Score: {hs:.1f} - 0.0\n"
+                    f"🛌 **{home.team_name}** is on a bye week!"
+                )
+            elif av:
+                result = (
+                    f"BYE vs. {away.team_name} ({away.wins}-{away.losses})\n"
+                    f"Score: 0.0 - {as_:.1f}\n"
+                    f"🛌 **{away.team_name}** is on a bye week!"
+                )
+            else:
+                continue
+
+            matchup_embed.add_field(name="Matchup", value=result, inline=False)
+
+        embeds.append(matchup_embed)
+    except Exception as e:
+        print(f"❌ Failed H2H w{week}: {e}")
+
+    # Season top-5
+    try:
+        season_top_embeds = await build_season_top_embeds(league, int(week))
+        pad_embeds(season_top_embeds)
+        embeds.extend(season_top_embeds)
+    except Exception as e:
+        print(f"❌ Failed season top5 through w{week}: {e}")
+
+    if embeds:
+        await channel.send(embeds=embeds)
+    else:
+        await channel.send(f"🤷 No data available for week {week} yet.")
+
+
 # ---------- Discord setup ----------
 intents = discord.Intents.default()
 intents.message_content = True
@@ -306,11 +388,9 @@ async def autopost(interaction: discord.Interaction, enabled: bool):
 
 @bot.tree.command(name="weeklyrecap", description="Manually trigger a weekly recap")
 async def weeklyrecap_slash(interaction: discord.Interaction):
-    await interaction.response.send_message("⏳ Generating weekly recap...", ephemeral=False)
-    msg = await interaction.original_response()
-    ctx = await bot.get_context(msg)
-    await send_weekly_recap(ctx)
-
+    await interaction.response.defer(thinking=True)
+    await send_weekly_recap_to_channel(interaction.guild, interaction.channel)
+    await interaction.followup.send("✅ Weekly recap posted.", ephemeral=True)
 
 # ---------- Weekly recap core ----------
 async def send_weekly_recap(ctx: commands.Context):
@@ -404,34 +484,18 @@ async def send_weekly_recap(ctx: commands.Context):
 # ---------- Scheduler (auto-post Tuesdays 11:00 AM ET) ----------
 @scheduler.scheduled_job("cron", day_of_week="tue", hour=11, minute=0)
 async def auto_post_weekly_recap():
-    # Iterate guilds that have autopost_enabled and a valid channel
     for guild in bot.guilds:
         try:
             settings = await get_guild_settings(str(guild.id))
-            if not settings:
-                continue
-            if not settings.get("autopost_enabled"):
+            if not settings or not settings.get("autopost_enabled"):
                 continue
             channel_id = settings.get("channel_id")
             if not channel_id:
                 continue
-
             channel = guild.get_channel(int(channel_id))
             if not isinstance(channel, (discord.TextChannel, discord.Thread)):
                 continue
-
-            # Build a fake ctx so we can reuse send_weekly_recap
-            class CtxAdapter(commands.Context):
-                def __init__(self, guild, channel):
-                    self.guild = guild
-                    self.channel = channel
-
-                async def send(self, *args, **kwargs):
-                    return await channel.send(*args, **kwargs)
-
-            ctx = CtxAdapter(guild, channel)
-            await send_weekly_recap(ctx)
-
+            await send_weekly_recap_to_channel(guild, channel)
         except Exception as e:
             print(f"❌ Auto-post failed for guild {guild.id}: {e}")
 
