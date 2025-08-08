@@ -18,6 +18,18 @@ from settings_manager import (
 
 async def send_weekly_recap_to_channel(guild: discord.Guild, channel: discord.abc.Messageable):
     """Builds all recap embeds and sends them to the given channel."""
+    # Ensure channel is messageable and we have perms
+    try:
+        perms = channel.permissions_for(guild.me)
+        if not perms.send_messages:
+            await channel.send  # just to force attribute access for typing; no-op
+    except Exception:
+        # Fallback: try configured channel if passed channel isn't usable
+        settings = await get_guild_settings(str(guild.id))
+        if settings and settings.get("channel_id"):
+            fallback = guild.get_channel(int(settings["channel_id"]))
+            if fallback and fallback != channel:
+                channel = fallback
     settings = await get_guild_settings(str(guild.id))
     if not settings:
         await channel.send("❌ This server hasn't been set up. Use `/setup` first.")
@@ -388,9 +400,32 @@ async def autopost(interaction: discord.Interaction, enabled: bool):
 
 @bot.tree.command(name="weeklyrecap", description="Manually trigger a weekly recap")
 async def weeklyrecap_slash(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
-    await send_weekly_recap_to_channel(interaction.guild, interaction.channel)
-    await interaction.followup.send("✅ Weekly recap posted.", ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        # Prefer configured channel; fallback to the channel where the command was used
+        settings = await get_guild_settings(str(interaction.guild.id))
+        channel = None
+        if settings and settings.get("channel_id"):
+            channel = interaction.guild.get_channel(int(settings["channel_id"]))
+        if channel is None:
+            channel = interaction.channel
+
+        # Permission check (send + embeds)
+        perms = channel.permissions_for(interaction.guild.me)
+        if not perms.send_messages:
+            await interaction.followup.send(f"❌ I can’t send messages in {channel.mention}. Give me **Send Messages**.", ephemeral=True)
+            return
+        if not perms.embed_links:
+            await interaction.followup.send(f"❌ I can’t send embeds in {channel.mention}. Give me **Embed Links**.", ephemeral=True)
+            return
+
+        await send_weekly_recap_to_channel(interaction.guild, channel)
+        await interaction.followup.send(f"✅ Weekly recap posted in {channel.mention}", ephemeral=True)
+
+    except Exception as e:
+        # Always tell you what went wrong instead of failing silently
+        await interaction.followup.send(f"❌ Error while posting: `{e}`", ephemeral=True)
+
 
 # ---------- Weekly recap core ----------
 async def send_weekly_recap(ctx: commands.Context):
