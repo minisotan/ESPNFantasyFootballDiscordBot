@@ -57,7 +57,7 @@ _GUILD_LOCKS = defaultdict(asyncio.Lock)
 QUEUE_WORKERS = int(os.getenv("QUEUE_WORKERS", "1"))  # 1 = strict FIFO; >1 = parallel consumption
 
 # ---------- ESPN image/constants ----------
-PLAYER_IMG = "https://a.espncdn.com/combiner/i?img=/i/headshots/nfl/players/full/{player_id}.png&w=200&h=200"
+PLAYER_IMG = "https://a.espncdn.com/i/headshots/nfl/players/full/{player_id}.png"
 TEAM_IMG = "https://a.espncdn.com/i/teamlogos/nfl/500/{code}.png"
 
 TEAM_LOGO = {
@@ -206,6 +206,20 @@ async def _process_weeklyrecap(interaction: discord.Interaction):
         f"✅ Weekly recap posted in {channel.mention}.",
         ephemeral=True
     )
+
+def normalize_weekly_embed_heights(embeds: list[discord.Embed]) -> None:
+    """Pad weekly-top embeds so they share the same visual height."""
+    if not embeds:
+        return
+    def line_count(e: discord.Embed) -> int:
+        desc = e.description or ""
+        return desc.count("\n") + (1 if desc else 0)
+    max_lines = max(line_count(e) for e in embeds)
+    for e in embeds:
+        missing = max_lines - line_count(e)
+        if missing > 0:
+            # zero-width space keeps a visible blank line in Discord
+            e.description = (e.description or "") + ("\n\u200b" * missing)
 
 @bot.event
 async def on_ready():
@@ -399,6 +413,7 @@ async def build_week_page(league: League, week: int) -> list[discord.Embed]:
     embeds.append(h2h)
     # 2) Weekly Top Players
     weekly_top_embeds = await build_weekly_top_embeds(league, week, precision)
+    normalize_weekly_embed_heights(weekly_top_embeds)  # <-- add this line
     embeds.extend(weekly_top_embeds)
     # 3) Season Top-5 (combined)
     season_top_embed = await build_season_top_embed_combined(league, week, precision)
@@ -629,8 +644,7 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
     parallel = " (processing up to "
     parallel += f"{QUEUE_WORKERS} at a time)" if QUEUE_WORKERS > 1 else ")"
     await interaction.followup.send(
-        f"🧾 You are **#{position}** in the global queue{parallel if QUEUE_WORKERS > 1 else ''}. "
-        f"I’ll post the weekly recap in {channel.mention} when it’s ready.",
+        f"Your Weekly Recap is being processed. Please wait while we gather data...",
         ephemeral=True
     )
 
