@@ -16,154 +16,18 @@ from settings_manager import (
     init_db
 )
 
-# --- New/updated embed builders to control order ---
-
-def build_head_to_head_embed(league, week: int) -> discord.Embed:
-    box_scores = league.box_scores(week=week)
-    e = Embed(
-        title=f"Week {week} Head-to-Head Matchups",
-        description="🏈 Weekly fantasy results",
-        color=0xf39c12
-    )
-    for game in box_scores:
-        home, away = game.home_team, game.away_team
-        hs, as_ = game.home_score, game.away_score
-        hv, av = hasattr(home, "team_name"), hasattr(away, "team_name")
-        if hv and av:
-            winner = home if hs > as_ else away
-            win_score = max(hs, as_)
-            result = (
-                f"{home.team_name} ({home.wins}-{home.losses}) vs. {away.team_name} ({away.wins}-{away.losses})\n"
-                f"Score: {hs:.1f} - {as_:.1f}\n"
-                f"🏆 Winner: **{winner.team_name}** (**{win_score:.1f}**)"
-            )
-        elif hv:
-            result = (
-                f"{home.team_name} ({home.wins}-{home.losses}) vs. BYE\n"
-                f"Score: {hs:.1f} - 0.0\n"
-                f"🛌 **{home.team_name}** is on a bye week!"
-            )
-        elif av:
-            result = (
-                f"BYE vs. {away.team_name} ({away.wins}-{away.losses})\n"
-                f"Score: 0.0 - {as_:.1f}\n"
-                f"🛌 **{away.team_name}** is on a bye week!"
-            )
-        else:
-            continue
-        e.add_field(name="Matchup", value=result, inline=False)
-    return e
-
-def build_power_rankings_embed(league) -> discord.Embed:
-    teams = sorted(
-        league.teams,
-        key=lambda t: (-(getattr(t, "wins", 0) or 0), -float(getattr(t, "points_for", 0) or 0.0))
-    )
-    e = Embed(title="📊 Power Rankings", description="Sorted by Wins, then Points For", color=0x2980b9)
-    for i, team in enumerate(teams, 1):
-        e.add_field(
-            name=f"{i}. {team.team_name.strip()}",
-            value=(
-                f"Record: {getattr(team, 'wins', 0)}-{getattr(team, 'losses', 0)} | "
-                f"PF: {float(getattr(team, 'points_for', 0) or 0):.1f} | "
-                f"PA: {float(getattr(team, 'points_against', 0) or 0):.1f}"
-            ),
-            inline=False,
-        )
-    return e
-
-def normalize_weekly_embed_heights(embed_list: list[discord.Embed]) -> None:
-    """
-    Make all weekly-top embeds the same visual height by padding their descriptions
-    to the max line count using zero-width space lines.
-    """
-    if not embed_list:
-        return
-
-    # Count lines per description (empty -> 0)
-    def line_count(e: discord.Embed) -> int:
-        return (e.description or "").count("\n") + (1 if (e.description or "") else 0)
-
-    max_lines = max(line_count(e) for e in embed_list)
-    for e in embed_list:
-        desc = e.description or ""
-        missing = max_lines - line_count(e)
-        if missing > 0:
-            # Add missing blank lines with zero-width spaces so Discord keeps them
-            e.description = desc + ("\n" + "\u200b") * missing
-
-def _line_count(text: str | None) -> int:
-    if not text:
-        return 0
-    return text.count("\n") + 1
-
-def estimate_embed_lines(e: discord.Embed) -> int:
-    # Very rough—but good enough for aligning heights
-    total = _line_count(e.title or "") + _line_count(e.description or "")
-    for f in e.fields:
-        # include field name + its value
-        total += _line_count(f.name or "") + _line_count(f.value or "")
-    # Footer/author/thumbnail add some height; give a small constant bump if present
-    if e.thumbnail and e.thumbnail.url:
-        total += 3
-    if e.footer and (e.footer.text or e.footer.icon_url):
-        total += 1
-    if e.author and (e.author.name or e.author.icon_url):
-        total += 1
-    return total
-
-def pad_embeds_to_target_lines(embeds: list[discord.Embed], target_lines: int) -> None:
-    """Add a hidden padding field so each embed reaches ~target_lines."""
-    if not embeds:
-        return
-    for e in embeds:
-        current = estimate_embed_lines(e)
-        missing = max(0, target_lines - current)
-        if missing > 0:
-            # Each line is a zero-width space so Discord renders the blank line
-            pad_value = ("\u200b\n" * missing).rstrip("\n")
-            e.add_field(name="\u200b", value=pad_value, inline=False)
-
-async def build_week_page(league, week: int) -> list[discord.Embed]:
-    """Return embeds for ONE week in the requested order:
-       1) Head-to-head, 2) Weekly top players, 3) Season top-5 (combined), 4) Power rankings.
-       Guaranteed ≤ 10 embeds."""
-    embeds: list[discord.Embed] = []
-
-    # 1) Head-to-Head FIRST
-    h2h = build_head_to_head_embed(league, week)
-    embeds.append(h2h)
-
-    # 2) Weekly Top Players (pad to align)
-    weekly_top_embeds = await build_weekly_top_embeds(league, week)
-    target_lines = estimate_embed_lines(h2h)  # <-- pass the EMBED, not the function
-    pad_embeds_to_target_lines(weekly_top_embeds, target_lines)
-    embeds.extend(weekly_top_embeds)
-
-    # 3) Season Top-5 (combined single embed) THROUGH selected week
-    season_top_embed = await build_season_top_embed_combined(league, week)
-    embeds.append(season_top_embed)
-
-    # 4) Power Rankings
-    embeds.append(build_power_rankings_embed(league))
-
-    # Defensive: Discord max 10
-    return embeds[:10]
-
 # ---------- Discord setup ----------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
-intents.members = False
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 scheduler = AsyncIOScheduler(timezone=ZoneInfo("America/New_York"))  # ET (DST aware)
 
-# ---------- ESPN image constants ----------
+# ---------- ESPN image/constants ----------
 PLAYER_IMG = "https://a.espncdn.com/combiner/i?img=/i/headshots/nfl/players/full/{player_id}.png&w=200&h=200"
 TEAM_IMG = "https://a.espncdn.com/i/teamlogos/nfl/500/{code}.png"
 
-# Map full team name → ESPN code (used for D/ST thumbnails)
 TEAM_LOGO = {
     "49ers": "sf", "Bears": "chi", "Bengals": "cin", "Bills": "buf", "Broncos": "den",
     "Browns": "cle", "Buccaneers": "tb", "Cardinals": "ari", "Chargers": "lac", "Chiefs": "kc",
@@ -173,28 +37,10 @@ TEAM_LOGO = {
     "Ravens": "bal", "Saints": "no", "Seahawks": "sea", "Steelers": "pit", "Texans": "hou",
     "Titans": "ten", "Vikings": "min"
 }
-
 DESIRED_POSITIONS = ['QB', 'RB', 'WR', 'TE', 'K', 'D/ST']
 
 
-# ---------- Utility: embed padding ----------
-def pad_embeds(embed_list: list[discord.Embed]) -> None:
-    """Make embed descriptions visually align by padding to the longest one."""
-    if not embed_list:
-        return
-    max_len = 0
-    for e in embed_list:
-        desc = e.description or ""
-        if len(desc) > max_len:
-            max_len = len(desc)
-    for e in embed_list:
-        d = e.description or ""
-        pad = max_len - len(d)
-        if pad > 0:
-            e.description = d + (" " * pad)  # simple visual padding
-
-
-# ---------- ESPN helpers ----------
+# ---------- Helpers ----------
 def build_league_from_settings(settings) -> League:
     return League(
         league_id=int(settings["league_id"]),
@@ -204,15 +50,14 @@ def build_league_from_settings(settings) -> League:
     )
 
 
-# ---------- Weekly & Season builders ----------
 async def build_weekly_top_embeds(league: League, week: int, starters_only: bool = False) -> list[discord.Embed]:
-    """Top player per desired position for a given week using box scores."""
+    """Top player per position for a given week using box scores."""
     best: dict[str, dict | None] = {p: None for p in DESIRED_POSITIONS}
     week_boxes = league.box_scores(week=week)
 
     for game in week_boxes:
         for lineup, fteam in ((game.home_lineup, game.home_team), (game.away_lineup, game.away_team)):
-            for bp in lineup:  # bp is a BoxScorePlayer
+            for bp in lineup:
                 pts = getattr(bp, "points", None)
                 base_pos = getattr(bp, "position", None)
                 slot_pos = getattr(bp, "slot_position", None)
@@ -266,11 +111,10 @@ async def build_weekly_top_embeds(league: League, week: int, starters_only: bool
     return embeds
 
 
-async def build_season_top_embed_combined(league, current_week: int, starters_only: bool = False) -> discord.Embed:
-    desired = ['QB', 'RB', 'WR', 'TE', 'K', 'D/ST']
-    season_points = {p: {} for p in desired}
-
-    for wk in range(1, current_week + 1):
+async def build_season_top_embed_combined(league: League, end_week: int, starters_only: bool = False) -> discord.Embed:
+    """Single embed with Top-5 for each position through end_week."""
+    season_points: dict[str, dict[str, float]] = {p: {} for p in DESIRED_POSITIONS}
+    for wk in range(1, end_week + 1):
         for game in league.box_scores(week=wk):
             for lineup in (game.home_lineup, game.away_lineup):
                 for bp in lineup:
@@ -282,24 +126,98 @@ async def build_season_top_embed_combined(league, current_week: int, starters_on
                     if starters_only and slot == "BE":
                         continue
                     pos = "D/ST" if pos in ("DST", "DEF", "Def") else pos
-                    if pos not in season_points:
+                    if pos not in DESIRED_POSITIONS:
                         continue
                     season_points[pos][bp.name] = season_points[pos].get(bp.name, 0.0) + float(pts)
 
     lines = []
-    for pos in desired:
+    for pos in DESIRED_POSITIONS:
         top5 = sorted(season_points[pos].items(), key=lambda x: x[1], reverse=True)[:5]
         section = "\n".join(f"• **{name}** — {pts:.2f}" for name, pts in top5) if top5 else "_No data_"
         lines.append(f"**{pos}**\n{section}")
 
-    return discord.Embed(
-        title=f"Season Top 5 (through Week {current_week})",
+    return Embed(
+        title=f"Season Top 5 (through Week {end_week})",
         description="\n\n".join(lines),
         color=0xe67e22
     )
 
 
+def build_head_to_head_embed(league: League, week: int) -> discord.Embed:
+    box_scores = league.box_scores(week=week)
+    e = Embed(
+        title=f"Week {week} Head-to-Head Matchups",
+        description="🏈 Weekly fantasy results",
+        color=0xf39c12
+    )
+    for game in box_scores:
+        home, away = game.home_team, game.away_team
+        hs, as_ = game.home_score, game.away_score
+        hv, av = hasattr(home, "team_name"), hasattr(away, "team_name")
+        if hv and av:
+            winner = home if hs > as_ else away
+            win_score = max(hs, as_)
+            result = (
+                f"{home.team_name} ({home.wins}-{home.losses}) vs. {away.team_name} ({away.wins}-{away.losses})\n"
+                f"Score: {hs:.1f} - {as_:.1f}\n"
+                f"🏆 Winner: **{winner.team_name}** (**{win_score:.1f}**)"
+            )
+        elif hv:
+            result = (
+                f"{home.team_name} ({home.wins}-{home.losses}) vs. BYE\n"
+                f"Score: {hs:.1f} - 0.0\n"
+                f"🛌 **{home.team_name}** is on a bye week!"
+            )
+        elif av:
+            result = (
+                f"BYE vs. {away.team_name} ({away.wins}-{away.losses})\n"
+                f"Score: 0.0 - {as_:.1f}\n"
+                f"🛌 **{away.team_name}** is on a bye week!"
+            )
+        else:
+            continue
+        e.add_field(name="Matchup", value=result, inline=False)
+    return e
 
+
+def build_power_rankings_embed(league: League) -> discord.Embed:
+    teams = sorted(
+        league.teams,
+        key=lambda t: (-(getattr(t, "wins", 0) or 0), -float(getattr(t, "points_for", 0) or 0.0))
+    )
+    e = Embed(title="📊 Power Rankings", description="Sorted by Wins, then Points For", color=0x2980b9)
+    for i, team in enumerate(teams, 1):
+        e.add_field(
+            name=f"{i}. {team.team_name.strip()}",
+            value=(
+                f"Record: {getattr(team, 'wins', 0)}-{getattr(team, 'losses', 0)} | "
+                f"PF: {float(getattr(team, 'points_for', 0) or 0):.1f} | "
+                f"PA: {float(getattr(team, 'points_against', 0) or 0):.1f}"
+            ),
+            inline=False,
+        )
+    return e
+
+
+async def build_week_page(league: League, week: int) -> list[discord.Embed]:
+    """One page for a given week, in this order:
+       1) Head-to-head, 2) Weekly Top Players, 3) Season Top-5 (combined), 4) Power Rankings."""
+    embeds: list[discord.Embed] = []
+    # 1) Head-to-Head FIRST
+    embeds.append(build_head_to_head_embed(league, week))
+    # 2) Weekly Top Players
+    weekly_top_embeds = await build_weekly_top_embeds(league, week)
+    embeds.extend(weekly_top_embeds)
+    # 3) Season Top-5 (combined) THROUGH selected week
+    season_top_embed = await build_season_top_embed_combined(league, week)
+    embeds.append(season_top_embed)
+    # 4) Power Rankings
+    embeds.append(build_power_rankings_embed(league))
+    # Safety: Discord max 10 embeds/message
+    return embeds[:10]
+
+
+# ---------- Week Navigator ----------
 class WeekNavigator(View):
     def __init__(self, week_embeds: list[list[discord.Embed]]):
         super().__init__(timeout=300)
@@ -307,7 +225,6 @@ class WeekNavigator(View):
         self.index = len(week_embeds) - 1
         self.message: discord.Message | None = None
 
-        # Dropdown weeks
         options = [discord.SelectOption(label=f"Week {i+1}", value=str(i)) for i in range(len(week_embeds))]
         self.select = Select(placeholder="Jump to week…", min_values=1, max_values=1, options=options)
         self.select.callback = self.jump_to_week
@@ -317,6 +234,7 @@ class WeekNavigator(View):
         self.message = message
 
     def update_button_states(self):
+        # Toggle the actual button attributes (not children indices)
         self.previous.disabled = (self.index == 0)
         self.next.disabled = (self.index == len(self.week_embeds) - 1)
 
@@ -348,6 +266,7 @@ class WeekNavigator(View):
         self.index = int(self.select.values[0])
         self.update_button_states()
         await self.message.edit(embeds=self.week_embeds[self.index], view=self)
+
 
 # ---------- Commands ----------
 @bot.event
@@ -467,19 +386,19 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
             or 1
         )
         if current_week < 1:
-            current_week = 1  # defensive
+            current_week = 1
 
-        # Build pages (one page per week) in your requested order
+        # Build pages (one per week)
         week_pages: list[list[discord.Embed]] = []
         for wk in range(1, current_week + 1):
             try:
                 page = await build_week_page(league, wk)
-                if page:  # only append non-empty pages
+                if page:
                     week_pages.append(page)
             except Exception as inner_e:
                 print(f"⚠️ Skipping week {wk} due to error: {inner_e}")
 
-        # If nothing was built (preseason/empty data), try week 1 once
+        # If nothing built (preseason/empty), try week 1
         if not week_pages:
             try:
                 fallback = await build_week_page(league, 1)
@@ -492,13 +411,8 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
             await interaction.followup.send("🤷 I couldn’t find any data to post yet.", ephemeral=True)
             return
 
-        # Send latest week with navigator
         view = WeekNavigator(week_pages)
         first_page = week_pages[-1]
-        # Extra guard: if somehow empty, post a tiny “no data” embed
-        if not first_page:
-            first_page = [Embed(title="No data yet", description="Try again later.", color=0x95a5a6)]
-
         message = await channel.send(embeds=first_page, view=view)
         view.set_message(message)
 
@@ -509,6 +423,7 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
 
     except Exception as e:
         await interaction.followup.send(f"❌ Error while posting: `{e}`", ephemeral=True)
+
 
 @bot.tree.command(name="debug_week", description="Show detected current week values")
 async def debug_week(interaction: discord.Interaction):
@@ -521,6 +436,7 @@ async def debug_week(interaction: discord.Interaction):
     cw = getattr(league, "current_week", None)
     nw = getattr(league, "nfl_week", None)
     await interaction.followup.send(f"current_week={cw!r}, nfl_week={nw!r}", ephemeral=True)
+
 
 # ---------- Scheduler (auto-post Tuesdays 11:00 AM ET) ----------
 @scheduler.scheduled_job("cron", day_of_week="tue", hour=11, minute=0)
@@ -535,12 +451,16 @@ async def auto_post_weekly_recap():
             if not isinstance(channel, (discord.TextChannel, discord.Thread)):
                 continue
 
-            # Build league + current week
             league = build_league_from_settings(settings)
-            week = int(getattr(league, "current_week", 1) or 1)
+            week = (
+                int(getattr(league, "current_week", 0) or 0)
+                or int(getattr(league, "nfl_week", 0) or 0)
+                or 1
+            )
+            if week < 1:
+                week = 1
 
-            # Build the single-page (≤10 embeds) for the current week
-            page = await build_week_page(league, week)
+            page = await build_week_page(league, week)  # one message, ≤10 embeds
             if not page:
                 await channel.send(f"🤷 No data available for week {week} yet.")
             else:
@@ -548,6 +468,7 @@ async def auto_post_weekly_recap():
 
         except Exception as e:
             print(f"❌ Auto-post failed for guild {guild.id}: {e}")
+
 
 # ---------- Entrypoint ----------
 if __name__ == "__main__":
