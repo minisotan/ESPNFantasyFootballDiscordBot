@@ -1,5 +1,6 @@
-# bot.py
+import os
 import asyncio
+from functools import partial
 import discord
 from collections import defaultdict
 _guild_locks = defaultdict(asyncio.Lock)
@@ -21,7 +22,6 @@ from settings_manager import (
 
 # ---------- Discord setup ----------
 intents = discord.Intents.default()
-intents.message_content = True
 intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -44,14 +44,27 @@ DESIRED_POSITIONS = ['QB', 'RB', 'WR', 'TE', 'K', 'D/ST']
 
 
 # ---------- Helpers ----------
-def build_league_from_settings(settings) -> League:
-    return League(
+async def build_league_from_settings(settings) -> League:
+    return await asyncio.to_thread(
+        League,
         league_id=int(settings["league_id"]),
         year=int(settings["season"]),
         espn_s2=settings["espn_s2"],
         swid=settings["swid"]
     )
 
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        await interaction.response.send_message(
+            f"⏳ Cooldown: try again in {error.retry_after:.1f}s.",
+            ephemeral=True
+        )
+    else:
+        # let your existing try/except in the command show details
+        pass
+
+@app_commands.default_permissions(manage_guild=True)
 @bot.tree.command(name="show_settings", description="Show saved league settings for this server (admin only).")
 async def show_settings(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -158,7 +171,7 @@ async def build_season_top_embed_combined(league: League, end_week: int, starter
     return Embed(
         title=f"Season Top 5 (through Week {end_week})",
         description="\n\n".join(lines),
-        color=0xe67e22
+        color=0x9b59b6
     )
 
 
@@ -325,6 +338,7 @@ async def setup(
     )
     await interaction.response.send_message("✅ Setup complete!", ephemeral=True)
 
+@app_commands.default_permissions(manage_guild=True)
 @bot.tree.command(name="configure", description="Update existing league settings")
 @app_commands.describe(
     league_id="(Optional) ESPN league id",
@@ -357,7 +371,7 @@ async def configure(
     await set_guild_settings(guild_id, **updated)
     await interaction.response.send_message("✅ Settings updated successfully!", ephemeral=True)
 
-
+@app_commands.default_permissions(manage_guild=True)
 @bot.tree.command(name="autopost", description="Enable or disable automatic weekly recaps")
 @app_commands.describe(enabled="Set to true to enable, false to disable")
 async def autopost(interaction: discord.Interaction, enabled: bool):
@@ -402,7 +416,7 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
                 return
 
             # Build league + robust current week
-            league = build_league_from_settings(settings)
+            league = await build_league_from_settings(settings)
             current_week = (
                 int(getattr(league, "current_week", 0) or 0)
                 or int(getattr(league, "nfl_week", 0) or 0)
@@ -455,7 +469,7 @@ async def debug_week(interaction: discord.Interaction):
     if not settings:
         await interaction.followup.send("No settings found.", ephemeral=True)
         return
-    league = build_league_from_settings(settings)
+    league = await build_league_from_settings(settings)
     cw = getattr(league, "current_week", None)
     nw = getattr(league, "nfl_week", None)
     await interaction.followup.send(f"current_week={cw!r}, nfl_week={nw!r}", ephemeral=True)
@@ -474,7 +488,7 @@ async def auto_post_weekly_recap():
             if not isinstance(channel, (discord.TextChannel, discord.Thread)):
                 continue
 
-            league = build_league_from_settings(settings)
+            league = await build_league_from_settings(settings)
             week = (
                 int(getattr(league, "current_week", 0) or 0)
                 or int(getattr(league, "nfl_week", 0) or 0)
