@@ -26,7 +26,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 scheduler = AsyncIOScheduler(timezone=ZoneInfo("America/New_York"))
 
 # ---------- Global ESPN concurrency gate ----------
-ESPN_MAX_CONCURRENCY = int(os.getenv("ESPN_MAX_CONCURRENCY", "2"))       # how many ESPN calls at once
+ESPN_MAX_CONCURRENCY = int(os.getenv("ESPN_MAX_CONCURRENCY", "1"))       # how many ESPN calls at once
 ESPN_TIMEOUT_SECONDS = int(os.getenv("ESPN_TIMEOUT_SECONDS", "25"))       # per-call timeout
 _ESPN_GATE = asyncio.Semaphore(ESPN_MAX_CONCURRENCY)
 
@@ -45,11 +45,16 @@ async def espn_call(func, *args, **kwargs):
 # Per-guild lock to keep one /weeklyrecap per server at a time (optional but nice)
 _guild_locks = defaultdict(asyncio.Lock)
 
-# One FIFO queue per guild
-_guild_queues: dict[int, asyncio.Queue] = defaultdict(asyncio.Queue)
+# ---- Global job queue (all guilds share this) ----
+_GLOBAL_QUEUE: asyncio.Queue[discord.Interaction] = asyncio.Queue()
+_GLOBAL_WORKERS: list[asyncio.Task] = []
 
-# Track the background worker task per guild
-_guild_workers: dict[int, asyncio.Task] = {}
+# Still keep a per-guild lock so two jobs from the SAME server don't overlap
+from collections import defaultdict
+_GUILD_LOCKS = defaultdict(asyncio.Lock)
+
+# How many jobs to process in parallel (separate from ESPN_MAX_CONCURRENCY)
+QUEUE_WORKERS = int(os.getenv("QUEUE_WORKERS", "1"))  # 1 = strict FIFO; >1 = parallel consumption
 
 # ---------- ESPN image/constants ----------
 PLAYER_IMG = "https://a.espncdn.com/combiner/i?img=/i/headshots/nfl/players/full/{player_id}.png&w=200&h=200"
@@ -202,30 +207,39 @@ async def _process_weeklyrecap(interaction: discord.Interaction):
         ephemeral=True
     )
 
-async def _ensure_worker(guild_id: int):
-    """Start a background worker for this guild if one isn't already running."""
-    if guild_id in _guild_workers and not _guild_workers[guild_id].done():
-        return
+@bot.event
+async def on_ready():
+    await init_db()
+    await bot.tree.sync()
+    _ensure_global_workers()   # <--- start workers
+    scheduler.start()
+    print(f"✅ Logged in as {bot.user}")
 
-    async def _worker():
-        q = _guild_queues[guild_id]
-        while True:
-            interaction: discord.Interaction = await q.get()
-            try:
+def _ensure_global_workers():
+    # Start exactly QUEUE_WORKERS background tasks
+    alive = [t for t in _GLOBAL_WORKERS if not t.done()]
+    missing = max(0, QUEUE_WORKERS - len(alive))
+    for _ in range(missing):
+        _GLOBAL_WORKERS.append(asyncio.create_task(_global_worker()))
+
+async def _global_worker():
+    while True:
+        interaction: discord.Interaction = await _GLOBAL_QUEUE.get()
+        try:
+            # Per-guild mutex so same guild requests don't overlap
+            async with _GUILD_LOCKS[interaction.guild.id]:
                 await _process_weeklyrecap(interaction)
-            except Exception as e:
-                # Best effort notify the requester
-                try:
-                    await interaction.followup.send(
-                        f"❌ Error while processing queued recap: `{e}`",
-                        ephemeral=True
-                    )
-                except Exception:
-                    pass
-            finally:
-                q.task_done()
+        except Exception as e:
+            try:
+                await interaction.followup.send(
+                    f"❌ Error while processing queued recap: `{e}`",
+                    ephemeral=True
+                )
+            except Exception:
+                pass
+        finally:
+            _GLOBAL_QUEUE.task_done()
 
-    _guild_workers[guild_id] = asyncio.create_task(_worker())
 
 async def build_weekly_top_embeds(league: League, week: int, precision: int, starters_only: bool = False) -> list[discord.Embed]:
     """Top player per position for a given week using box scores."""
@@ -585,24 +599,19 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @app_commands.guild_only()
 @bot.tree.command(name="weeklyrecap", description="Manually trigger a weekly recap")
 async def weeklyrecap_slash(interaction: discord.Interaction):
-    # Acknowledge immediately so Discord doesn’t time out
+    # Ack immediately so Discord doesn't time out
     await interaction.response.defer(thinking=True, ephemeral=True)
 
-    guild_id = interaction.guild.id
-
     # Quick preflight (fail fast before queuing)
-    settings = await get_guild_settings(str(guild_id))
+    settings = await get_guild_settings(str(interaction.guild.id))
     if not settings:
         await interaction.followup.send("❌ This server hasn't been set up. Use `/setup` first.", ephemeral=True)
         return
 
-    # Prefer configured channel; fallback to where the command was used
     channel = (
         interaction.guild.get_channel(int(settings["channel_id"]))
         if settings.get("channel_id") else interaction.channel
     )
-
-    # Permission check
     perms = channel.permissions_for(interaction.guild.me)
     if not perms.send_messages or not perms.embed_links:
         await interaction.followup.send(
@@ -611,17 +620,20 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
         )
         return
 
-    # Enqueue and report position
-    q = _guild_queues[guild_id]
-    position = q.qsize() + 1  # 1-based: your spot after enqueue
-    await q.put(interaction)
-    await _ensure_worker(guild_id)
+    # Enqueue to the global queue and show GLOBAL position
+    position = _GLOBAL_QUEUE.qsize() + 1  # 1-based position after this enqueue
+    await _GLOBAL_QUEUE.put(interaction)
+    _ensure_global_workers()
 
+    # If you run multiple workers, make that clear in the message
+    parallel = " (processing up to "
+    parallel += f"{QUEUE_WORKERS} at a time)" if QUEUE_WORKERS > 1 else ")"
     await interaction.followup.send(
-        f"🧾 You are **#{position}** in the queue. "
+        f"🧾 You are **#{position}** in the global queue{parallel if QUEUE_WORKERS > 1 else ''}. "
         f"I’ll post the weekly recap in {channel.mention} when it’s ready.",
         ephemeral=True
     )
+
 
 @bot.tree.command(name="debug_week", description="Show detected current week values")
 @app_commands.guild_only()
