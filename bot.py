@@ -1,13 +1,11 @@
+# bot.py
 import os
 import asyncio
-from functools import partial
-import discord
 from collections import defaultdict
-_guild_locks = defaultdict(asyncio.Lock)
+import discord
 from discord.ext import commands
 from discord.ui import Button, View, Select
 from discord import app_commands, Embed
-from discord.app_commands import checks
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from zoneinfo import ZoneInfo
 
@@ -21,11 +19,31 @@ from settings_manager import (
 )
 
 # ---------- Discord setup ----------
-intents = discord.Intents.default()
-intents.guilds = True
-
+intents = discord.Intents.default()  # Slash-command bot doesn't need message_content
 bot = commands.Bot(command_prefix="!", intents=intents)
-scheduler = AsyncIOScheduler(timezone=ZoneInfo("America/New_York"))  # ET (DST aware)
+
+# Scheduler in ET (DST-aware): Tuesdays @ 11:00 AM
+scheduler = AsyncIOScheduler(timezone=ZoneInfo("America/New_York"))
+
+# ---------- Global ESPN concurrency gate ----------
+ESPN_MAX_CONCURRENCY = int(os.getenv("ESPN_MAX_CONCURRENCY", "2"))       # how many ESPN calls at once
+ESPN_TIMEOUT_SECONDS = int(os.getenv("ESPN_TIMEOUT_SECONDS", "25"))       # per-call timeout
+_ESPN_GATE = asyncio.Semaphore(ESPN_MAX_CONCURRENCY)
+
+async def espn_call(func, *args, **kwargs):
+    """
+    Run a blocking espn_api call in a worker thread with:
+      - global concurrency limit (queue instead of fail)
+      - timeout guard
+    """
+    async with _ESPN_GATE:
+        return await asyncio.wait_for(
+            asyncio.to_thread(func, *args, **kwargs),
+            timeout=ESPN_TIMEOUT_SECONDS
+        )
+
+# Per-guild lock to keep one /weeklyrecap per server at a time (optional but nice)
+_guild_locks = defaultdict(asyncio.Lock)
 
 # ---------- ESPN image/constants ----------
 PLAYER_IMG = "https://a.espncdn.com/combiner/i?img=/i/headshots/nfl/players/full/{player_id}.png&w=200&h=200"
@@ -42,10 +60,10 @@ TEAM_LOGO = {
 }
 DESIRED_POSITIONS = ['QB', 'RB', 'WR', 'TE', 'K', 'D/ST']
 
-
 # ---------- Helpers ----------
 async def build_league_from_settings(settings) -> League:
-    return await asyncio.to_thread(
+    # espn_api does network IO in League(...), so offload it too
+    return await espn_call(
         League,
         league_id=int(settings["league_id"]),
         year=int(settings["season"]),
@@ -53,38 +71,10 @@ async def build_league_from_settings(settings) -> League:
         swid=settings["swid"]
     )
 
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CommandOnCooldown):
-        await interaction.response.send_message(
-            f"⏳ Cooldown: try again in {error.retry_after:.1f}s.",
-            ephemeral=True
-        )
-    else:
-        # let your existing try/except in the command show details
-        pass
-
-@app_commands.default_permissions(manage_guild=True)
-@bot.tree.command(name="show_settings", description="Show saved league settings for this server (admin only).")
-async def show_settings(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    s = await get_guild_settings(str(interaction.guild.id))
-    if not s:
-        await interaction.followup.send("No settings saved yet. Use `/setup`.", ephemeral=True)
-        return
-    # Don’t echo cookies back; just confirm presence.
-    msg = (
-        f"League ID: {s['league_id']}\n"
-        f"Season: {s['season']}\n"
-        f"Channel: <#{s['channel_id']}>\n"
-        f"Autopost: {'Enabled' if s.get('autopost_enabled') else 'Disabled'}"
-    )
-    await interaction.followup.send(msg, ephemeral=True)
-
 async def build_weekly_top_embeds(league: League, week: int, starters_only: bool = False) -> list[discord.Embed]:
     """Top player per position for a given week using box scores."""
     best: dict[str, dict | None] = {p: None for p in DESIRED_POSITIONS}
-    week_boxes = await asyncio.to_thread(league.box_scores, week=week)
+    week_boxes = await espn_call(league.box_scores, week=week)
 
     for game in week_boxes:
         for lineup, fteam in ((game.home_lineup, game.home_team), (game.away_lineup, game.away_team)):
@@ -133,7 +123,7 @@ async def build_weekly_top_embeds(league: League, week: int, starters_only: bool
                 f"Fantasy Points: **{top['points']:.2f}**\n"
                 f"Fantasy Team: *{top['team']}*"
             ),
-            color=0x1abc9c
+            color=0x1abc9c  # teal/green for weekly tops
         )
         if image_url:
             e.set_thumbnail(url=image_url)
@@ -141,12 +131,11 @@ async def build_weekly_top_embeds(league: League, week: int, starters_only: bool
 
     return embeds
 
-
 async def build_season_top_embed_combined(league: League, end_week: int, starters_only: bool = False) -> discord.Embed:
     """Single embed with Top-5 for each position through end_week."""
     season_points: dict[str, dict[str, float]] = {p: {} for p in DESIRED_POSITIONS}
     for wk in range(1, end_week + 1):
-        week_boxes = await asyncio.to_thread(league.box_scores, week=wk)
+        week_boxes = await espn_call(league.box_scores, week=wk)
         for game in week_boxes:
             for lineup in (game.home_lineup, game.away_lineup):
                 for bp in lineup:
@@ -168,19 +157,19 @@ async def build_season_top_embed_combined(league: League, end_week: int, starter
         section = "\n".join(f"• **{name}** — {pts:.2f}" for name, pts in top5) if top5 else "_No data_"
         lines.append(f"**{pos}**\n{section}")
 
+    # Purple so it’s visually distinct from H2H
     return Embed(
         title=f"Season Top 5 (through Week {end_week})",
         description="\n\n".join(lines),
         color=0x9b59b6
     )
 
-
 async def build_head_to_head_embed(league: League, week: int) -> discord.Embed:
-    box_scores = await asyncio.to_thread(league.box_scores, week=week)
+    box_scores = await espn_call(league.box_scores, week=week)
     e = Embed(
         title=f"Week {week} Head-to-Head Matchups",
         description="🏈 Weekly fantasy results",
-        color=0xf39c12
+        color=0xf39c12  # orange
     )
     for game in box_scores:
         home, away = game.home_team, game.away_team
@@ -212,7 +201,7 @@ async def build_head_to_head_embed(league: League, week: int) -> discord.Embed:
     return e
 
 async def build_power_rankings_embed(league: League) -> discord.Embed:
-    teams = await asyncio.to_thread(lambda: list(league.teams))
+    teams = await espn_call(lambda: list(league.teams))
     teams = sorted(
         teams,
         key=lambda t: (-(getattr(t, "wins", 0) or 0), -float(getattr(t, "points_for", 0) or 0.0))
@@ -230,26 +219,23 @@ async def build_power_rankings_embed(league: League) -> discord.Embed:
         )
     return e
 
-
 async def build_week_page(league: League, week: int) -> list[discord.Embed]:
     """One page for a given week, in this order:
        1) Head-to-head, 2) Weekly Top Players, 3) Season Top-5 (combined), 4) Power Rankings."""
     embeds: list[discord.Embed] = []
-    # 1) Head-to-Head FIRST
+    # 1) Head-to-Head
     h2h = await build_head_to_head_embed(league, week)
     embeds.append(h2h)
     # 2) Weekly Top Players
     weekly_top_embeds = await build_weekly_top_embeds(league, week)
     embeds.extend(weekly_top_embeds)
-    # 3) Season Top-5 (combined) THROUGH selected week
+    # 3) Season Top-5 (combined)
     season_top_embed = await build_season_top_embed_combined(league, week)
     embeds.append(season_top_embed)
     # 4) Power Rankings
     pr = await build_power_rankings_embed(league)
     embeds.append(pr)
-    # Safety: Discord max 10 embeds/message
-    return embeds[:10]
-
+    return embeds[:10]  # Discord limit guard
 
 # ---------- Week Navigator ----------
 class WeekNavigator(View):
@@ -268,7 +254,6 @@ class WeekNavigator(View):
         self.message = message
 
     def update_button_states(self):
-        # Toggle the actual button attributes (not children indices)
         self.previous.disabled = (self.index == 0)
         self.next.disabled = (self.index == len(self.week_embeds) - 1)
 
@@ -301,7 +286,6 @@ class WeekNavigator(View):
         self.update_button_states()
         await self.message.edit(embeds=self.week_embeds[self.index], view=self)
 
-
 # ---------- Commands ----------
 @bot.event
 async def on_ready():
@@ -310,6 +294,7 @@ async def on_ready():
     scheduler.start()
     print(f"✅ Logged in as {bot.user}")
 
+@app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
 @bot.tree.command(name="setup", description="Configure league for this server")
 @app_commands.describe(
@@ -327,6 +312,22 @@ async def setup(
     espn_s2: str,
     channel: discord.TextChannel
 ):
+    await interaction.response.defer(ephemeral=True)
+    # Validate cookies/league up front so we don't save bad creds
+    try:
+        test_league = await espn_call(
+            League, league_id=int(league_id), year=int(season), swid=swid, espn_s2=espn_s2
+        )
+        _ = await espn_call(lambda: list(test_league.teams))
+    except Exception as e:
+        await interaction.followup.send(
+            "❌ Those cookies don’t grant access to this league. "
+            "Make sure they’re copied from an account in the league and that ESPN_S2 is not URL-encoded.\n"
+            f"Error: `{e}`",
+            ephemeral=True
+        )
+        return
+
     guild_id = str(interaction.guild.id)
     await set_guild_settings(
         guild_id,
@@ -336,8 +337,9 @@ async def setup(
         espn_s2=espn_s2,
         channel_id=str(channel.id)
     )
-    await interaction.response.send_message("✅ Setup complete!", ephemeral=True)
+    await interaction.followup.send("✅ Setup complete and validated!", ephemeral=True)
 
+@app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
 @bot.tree.command(name="configure", description="Update existing league settings")
 @app_commands.describe(
@@ -355,10 +357,11 @@ async def configure(
     espn_s2: str | None = None,
     channel: discord.TextChannel | None = None
 ):
+    await interaction.response.defer(ephemeral=True)
     guild_id = str(interaction.guild.id)
     current = await get_guild_settings(guild_id)
     if not current:
-        await interaction.response.send_message("❌ This server hasn't been set up. Use `/setup` first.", ephemeral=True)
+        await interaction.followup.send("❌ This server hasn't been set up. Use `/setup` first.", ephemeral=True)
         return
 
     updated = {
@@ -369,15 +372,17 @@ async def configure(
         "channel_id": str(channel.id) if channel else current["channel_id"]
     }
     await set_guild_settings(guild_id, **updated)
-    await interaction.response.send_message("✅ Settings updated successfully!", ephemeral=True)
+    await interaction.followup.send("✅ Settings updated successfully!", ephemeral=True)
 
+@app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
 @bot.tree.command(name="autopost", description="Enable or disable automatic weekly recaps")
 @app_commands.describe(enabled="Set to true to enable, false to disable")
 async def autopost(interaction: discord.Interaction, enabled: bool):
+    await interaction.response.defer(ephemeral=True)
     settings = await get_guild_settings(str(interaction.guild.id))
     if not settings:
-        await interaction.response.send_message("❌ This server hasn't been set up. Use `/setup` first.", ephemeral=True)
+        await interaction.followup.send("❌ This server hasn't been set up. Use `/setup` first.", ephemeral=True)
         return
 
     await set_autopost(str(interaction.guild.id), enabled)
@@ -385,22 +390,54 @@ async def autopost(interaction: discord.Interaction, enabled: bool):
         "✅ Auto-posting enabled! Weekly recaps will post Tuesdays at 11:00 AM ET."
         if enabled else "❌ Auto-posting disabled."
     )
-    await interaction.response.send_message(msg, ephemeral=True)
+    await interaction.followup.send(msg, ephemeral=True)
 
+@app_commands.guild_only()
+@bot.tree.command(name="show_settings", description="Show saved league settings for this server (admin only).")
+@app_commands.default_permissions(manage_guild=True)
+async def show_settings(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    s = await get_guild_settings(str(interaction.guild.id))
+    if not s:
+        await interaction.followup.send("No settings saved yet. Use `/setup`.", ephemeral=True)
+        return
+    msg = (
+        f"League ID: {s['league_id']}\n"
+        f"Season: {s['season']}\n"
+        f"Channel: <#{s['channel_id']}>\n"
+        f"Autopost: {'Enabled' if s.get('autopost_enabled') else 'Disabled'}"
+    )
+    await interaction.followup.send(msg, ephemeral=True)
 
-@checks.cooldown(1, 30.0)
+# Cooldown feedback
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        try:
+            await interaction.response.send_message(
+                f"⏳ Cooldown: try again in {error.retry_after:.1f}s.",
+                ephemeral=True
+            )
+        except discord.InteractionResponded:
+            await interaction.followup.send(
+                f"⏳ Cooldown: try again in {error.retry_after:.1f}s.",
+                ephemeral=True
+            )
+
+# Weekly recap (with per-guild lock)
+@app_commands.guild_only()
 @bot.tree.command(name="weeklyrecap", description="Manually trigger a weekly recap")
+@app_commands.checks.cooldown(1, 30.0)  # 1 per 30s per guild
 async def weeklyrecap_slash(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True, ephemeral=True)
-    lock = _guild_locks[interaction.guild.id]
-    async with lock:
+    async with _guild_locks[interaction.guild.id]:
         try:
             settings = await get_guild_settings(str(interaction.guild.id))
             if not settings:
                 await interaction.followup.send("❌ This server hasn't been set up. Use `/setup` first.", ephemeral=True)
                 return
 
-            # Prefer configured channel; fallback to where the command was used
+            # Prefer configured channel; fallback to where command was used
             channel = (
                 interaction.guild.get_channel(int(settings["channel_id"]))
                 if settings.get("channel_id") else interaction.channel
@@ -415,7 +452,7 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
                 )
                 return
 
-            # Build league + robust current week
+            # League + week (robust)
             league = await build_league_from_settings(settings)
             current_week = (
                 int(getattr(league, "current_week", 0) or 0)
@@ -425,7 +462,7 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
             if current_week < 1:
                 current_week = 1
 
-            # Build pages (one per week)
+            # Build week pages (1..current_week)
             week_pages: list[list[discord.Embed]] = []
             for wk in range(1, current_week + 1):
                 try:
@@ -435,8 +472,8 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
                 except Exception as inner_e:
                     print(f"⚠️ Skipping week {wk} due to error: {inner_e}")
 
-            # If nothing built (preseason/empty), try week 1
             if not week_pages:
+                # Fallback to week 1 once
                 try:
                     fallback = await build_week_page(league, 1)
                     if fallback:
@@ -448,6 +485,7 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
                 await interaction.followup.send("🤷 I couldn’t find any data to post yet.", ephemeral=True)
                 return
 
+            # Send with navigator
             view = WeekNavigator(week_pages)
             first_page = week_pages[-1]
             message = await channel.send(embeds=first_page, view=view)
@@ -461,8 +499,8 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
         except Exception as e:
             await interaction.followup.send(f"❌ Error while posting: `{e}`", ephemeral=True)
 
-
 @bot.tree.command(name="debug_week", description="Show detected current week values")
+@app_commands.guild_only()
 async def debug_week(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     settings = await get_guild_settings(str(interaction.guild.id))
@@ -473,7 +511,6 @@ async def debug_week(interaction: discord.Interaction):
     cw = getattr(league, "current_week", None)
     nw = getattr(league, "nfl_week", None)
     await interaction.followup.send(f"current_week={cw!r}, nfl_week={nw!r}", ephemeral=True)
-
 
 # ---------- Scheduler (auto-post Tuesdays 11:00 AM ET) ----------
 @scheduler.scheduled_job("cron", day_of_week="tue", hour=11, minute=0)
@@ -497,7 +534,7 @@ async def auto_post_weekly_recap():
             if week < 1:
                 week = 1
 
-            page = await build_week_page(league, week)  # one message, ≤10 embeds
+            page = await build_week_page(league, week)
             if not page:
                 await channel.send(f"🤷 No data available for week {week} yet.")
             else:
@@ -506,8 +543,6 @@ async def auto_post_weekly_recap():
         except Exception as e:
             print(f"❌ Auto-post failed for guild {guild.id}: {e}")
 
-
 # ---------- Entrypoint ----------
 if __name__ == "__main__":
-    token = get_discord_bot_token()
-    asyncio.run(bot.start(token))
+    asyncio.run(bot.start(get_discord_bot_token()))
