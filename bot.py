@@ -131,11 +131,12 @@ async def build_week_page(league, week: int) -> list[discord.Embed]:
     embeds: list[discord.Embed] = []
 
     # 1) Head-to-Head FIRST
-    embeds.append(build_head_to_head_embed(league, week))
+    h2h = build_head_to_head_embed(league, week)
+    embeds.append(h2h)
 
     # 2) Weekly Top Players (pad to align)
     weekly_top_embeds = await build_weekly_top_embeds(league, week)
-    target_lines = estimate_embed_lines(build_head_to_head_embed)
+    target_lines = estimate_embed_lines(h2h)  # <-- pass the EMBED, not the function
     pad_embeds_to_target_lines(weekly_top_embeds, target_lines)
     embeds.extend(weekly_top_embeds)
 
