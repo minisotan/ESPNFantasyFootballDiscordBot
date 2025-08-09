@@ -1,9 +1,12 @@
 # bot.py
 import asyncio
 import discord
+from collections import defaultdict
+_guild_locks = defaultdict(asyncio.Lock)
 from discord.ext import commands
 from discord.ui import Button, View, Select
 from discord import app_commands, Embed
+from discord.app_commands import checks
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from zoneinfo import ZoneInfo
 
@@ -68,7 +71,7 @@ async def show_settings(interaction: discord.Interaction):
 async def build_weekly_top_embeds(league: League, week: int, starters_only: bool = False) -> list[discord.Embed]:
     """Top player per position for a given week using box scores."""
     best: dict[str, dict | None] = {p: None for p in DESIRED_POSITIONS}
-    week_boxes = league.box_scores(week=week)
+    week_boxes = await asyncio.to_thread(league.box_scores, week=week)
 
     for game in week_boxes:
         for lineup, fteam in ((game.home_lineup, game.home_team), (game.away_lineup, game.away_team)):
@@ -130,7 +133,8 @@ async def build_season_top_embed_combined(league: League, end_week: int, starter
     """Single embed with Top-5 for each position through end_week."""
     season_points: dict[str, dict[str, float]] = {p: {} for p in DESIRED_POSITIONS}
     for wk in range(1, end_week + 1):
-        for game in league.box_scores(week=wk):
+        week_boxes = await asyncio.to_thread(league.box_scores, week=wk)
+        for game in week_boxes:
             for lineup in (game.home_lineup, game.away_lineup):
                 for bp in lineup:
                     pts = getattr(bp, "points", None)
@@ -158,8 +162,8 @@ async def build_season_top_embed_combined(league: League, end_week: int, starter
     )
 
 
-def build_head_to_head_embed(league: League, week: int) -> discord.Embed:
-    box_scores = league.box_scores(week=week)
+async def build_head_to_head_embed(league: League, week: int) -> discord.Embed:
+    box_scores = await asyncio.to_thread(league.box_scores, week=week)
     e = Embed(
         title=f"Week {week} Head-to-Head Matchups",
         description="🏈 Weekly fantasy results",
@@ -194,10 +198,10 @@ def build_head_to_head_embed(league: League, week: int) -> discord.Embed:
         e.add_field(name="Matchup", value=result, inline=False)
     return e
 
-
-def build_power_rankings_embed(league: League) -> discord.Embed:
+async def build_power_rankings_embed(league: League) -> discord.Embed:
+    teams = await asyncio.to_thread(lambda: list(league.teams))
     teams = sorted(
-        league.teams,
+        teams,
         key=lambda t: (-(getattr(t, "wins", 0) or 0), -float(getattr(t, "points_for", 0) or 0.0))
     )
     e = Embed(title="📊 Power Rankings", description="Sorted by Wins, then Points For", color=0x2980b9)
@@ -219,7 +223,8 @@ async def build_week_page(league: League, week: int) -> list[discord.Embed]:
        1) Head-to-head, 2) Weekly Top Players, 3) Season Top-5 (combined), 4) Power Rankings."""
     embeds: list[discord.Embed] = []
     # 1) Head-to-Head FIRST
-    embeds.append(build_head_to_head_embed(league, week))
+    h2h = await build_head_to_head_embed(league, week)
+    embeds.append(h2h)
     # 2) Weekly Top Players
     weekly_top_embeds = await build_weekly_top_embeds(league, week)
     embeds.extend(weekly_top_embeds)
@@ -227,7 +232,8 @@ async def build_week_page(league: League, week: int) -> list[discord.Embed]:
     season_top_embed = await build_season_top_embed_combined(league, week)
     embeds.append(season_top_embed)
     # 4) Power Rankings
-    embeds.append(build_power_rankings_embed(league))
+    pr = await build_power_rankings_embed(league)
+    embeds.append(pr)
     # Safety: Discord max 10 embeds/message
     return embeds[:10]
 
@@ -291,7 +297,7 @@ async def on_ready():
     scheduler.start()
     print(f"✅ Logged in as {bot.user}")
 
-
+@app_commands.default_permissions(manage_guild=True)
 @bot.tree.command(name="setup", description="Configure league for this server")
 @app_commands.describe(
     league_id="ESPN league id (number)",
@@ -318,7 +324,6 @@ async def setup(
         channel_id=str(channel.id)
     )
     await interaction.response.send_message("✅ Setup complete!", ephemeral=True)
-
 
 @bot.tree.command(name="configure", description="Update existing league settings")
 @app_commands.describe(
@@ -369,75 +374,78 @@ async def autopost(interaction: discord.Interaction, enabled: bool):
     await interaction.response.send_message(msg, ephemeral=True)
 
 
+@checks.cooldown(1, 30.0)
 @bot.tree.command(name="weeklyrecap", description="Manually trigger a weekly recap")
 async def weeklyrecap_slash(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True, ephemeral=True)
-    try:
-        settings = await get_guild_settings(str(interaction.guild.id))
-        if not settings:
-            await interaction.followup.send("❌ This server hasn't been set up. Use `/setup` first.", ephemeral=True)
-            return
+    lock = _guild_locks[interaction.guild.id]
+    async with lock:
+        try:
+            settings = await get_guild_settings(str(interaction.guild.id))
+            if not settings:
+                await interaction.followup.send("❌ This server hasn't been set up. Use `/setup` first.", ephemeral=True)
+                return
 
-        # Prefer configured channel; fallback to where the command was used
-        channel = (
-            interaction.guild.get_channel(int(settings["channel_id"]))
-            if settings.get("channel_id") else interaction.channel
-        )
+            # Prefer configured channel; fallback to where the command was used
+            channel = (
+                interaction.guild.get_channel(int(settings["channel_id"]))
+                if settings.get("channel_id") else interaction.channel
+            )
 
-        # Permission check
-        perms = channel.permissions_for(interaction.guild.me)
-        if not perms.send_messages or not perms.embed_links:
+            # Permission check
+            perms = channel.permissions_for(interaction.guild.me)
+            if not perms.send_messages or not perms.embed_links:
+                await interaction.followup.send(
+                    f"❌ I don’t have permission to post embeds in {channel.mention}.",
+                    ephemeral=True
+                )
+                return
+
+            # Build league + robust current week
+            league = build_league_from_settings(settings)
+            current_week = (
+                int(getattr(league, "current_week", 0) or 0)
+                or int(getattr(league, "nfl_week", 0) or 0)
+                or 1
+            )
+            if current_week < 1:
+                current_week = 1
+
+            # Build pages (one per week)
+            week_pages: list[list[discord.Embed]] = []
+            for wk in range(1, current_week + 1):
+                try:
+                    page = await build_week_page(league, wk)
+                    if page:
+                        week_pages.append(page)
+                except Exception as inner_e:
+                    print(f"⚠️ Skipping week {wk} due to error: {inner_e}")
+
+            # If nothing built (preseason/empty), try week 1
+            if not week_pages:
+                try:
+                    fallback = await build_week_page(league, 1)
+                    if fallback:
+                        week_pages.append(fallback)
+                except Exception as fe:
+                    print(f"⚠️ Fallback week 1 failed: {fe}")
+
+            if not week_pages:
+                await interaction.followup.send("🤷 I couldn’t find any data to post yet.", ephemeral=True)
+                return
+
+            view = WeekNavigator(week_pages)
+            first_page = week_pages[-1]
+            message = await channel.send(embeds=first_page, view=view)
+            view.set_message(message)
+
             await interaction.followup.send(
-                f"❌ I don’t have permission to post embeds in {channel.mention}.",
+                f"✅ Weekly recap posted in {channel.mention} with week navigation (current week: {current_week}).",
                 ephemeral=True
             )
-            return
 
-        # Build league + robust current week
-        league = build_league_from_settings(settings)
-        current_week = (
-            int(getattr(league, "current_week", 0) or 0)
-            or int(getattr(league, "nfl_week", 0) or 0)
-            or 1
-        )
-        if current_week < 1:
-            current_week = 1
-
-        # Build pages (one per week)
-        week_pages: list[list[discord.Embed]] = []
-        for wk in range(1, current_week + 1):
-            try:
-                page = await build_week_page(league, wk)
-                if page:
-                    week_pages.append(page)
-            except Exception as inner_e:
-                print(f"⚠️ Skipping week {wk} due to error: {inner_e}")
-
-        # If nothing built (preseason/empty), try week 1
-        if not week_pages:
-            try:
-                fallback = await build_week_page(league, 1)
-                if fallback:
-                    week_pages.append(fallback)
-            except Exception as fe:
-                print(f"⚠️ Fallback week 1 failed: {fe}")
-
-        if not week_pages:
-            await interaction.followup.send("🤷 I couldn’t find any data to post yet.", ephemeral=True)
-            return
-
-        view = WeekNavigator(week_pages)
-        first_page = week_pages[-1]
-        message = await channel.send(embeds=first_page, view=view)
-        view.set_message(message)
-
-        await interaction.followup.send(
-            f"✅ Weekly recap posted in {channel.mention} with week navigation (current week: {current_week}).",
-            ephemeral=True
-        )
-
-    except Exception as e:
-        await interaction.followup.send(f"❌ Error while posting: `{e}`", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error while posting: `{e}`", ephemeral=True)
 
 
 @bot.tree.command(name="debug_week", description="Show detected current week values")
