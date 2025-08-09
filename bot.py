@@ -92,6 +92,38 @@ def normalize_weekly_embed_heights(embed_list: list[discord.Embed]) -> None:
             # Add missing blank lines with zero-width spaces so Discord keeps them
             e.description = desc + ("\n" + "\u200b") * missing
 
+def _line_count(text: str | None) -> int:
+    if not text:
+        return 0
+    return text.count("\n") + 1
+
+def estimate_embed_lines(e: discord.Embed) -> int:
+    # Very rough—but good enough for aligning heights
+    total = _line_count(e.title or "") + _line_count(e.description or "")
+    for f in e.fields:
+        # include field name + its value
+        total += _line_count(f.name or "") + _line_count(f.value or "")
+    # Footer/author/thumbnail add some height; give a small constant bump if present
+    if e.thumbnail and e.thumbnail.url:
+        total += 3
+    if e.footer and (e.footer.text or e.footer.icon_url):
+        total += 1
+    if e.author and (e.author.name or e.author.icon_url):
+        total += 1
+    return total
+
+def pad_embeds_to_target_lines(embeds: list[discord.Embed], target_lines: int) -> None:
+    """Add a hidden padding field so each embed reaches ~target_lines."""
+    if not embeds:
+        return
+    for e in embeds:
+        current = estimate_embed_lines(e)
+        missing = max(0, target_lines - current)
+        if missing > 0:
+            # Each line is a zero-width space so Discord renders the blank line
+            pad_value = ("\u200b\n" * missing).rstrip("\n")
+            e.add_field(name="\u200b", value=pad_value, inline=False)
+
 async def build_week_page(league, week: int) -> list[discord.Embed]:
     """Return embeds for ONE week in the requested order:
        1) Head-to-head, 2) Weekly top players, 3) Season top-5 (combined), 4) Power rankings.
@@ -103,7 +135,8 @@ async def build_week_page(league, week: int) -> list[discord.Embed]:
 
     # 2) Weekly Top Players (pad to align)
     weekly_top_embeds = await build_weekly_top_embeds(league, week)
-    normalize_weekly_embed_heights(weekly_top_embeds)
+    target_lines = estimate_embed_lines(build_head_to_head_embed)
+    pad_embeds_to_target_lines(weekly_top_embeds, target_lines)
     embeds.extend(weekly_top_embeds)
 
     # 3) Season Top-5 (combined single embed) THROUGH selected week
