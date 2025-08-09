@@ -45,6 +45,12 @@ async def espn_call(func, *args, **kwargs):
 # Per-guild lock to keep one /weeklyrecap per server at a time (optional but nice)
 _guild_locks = defaultdict(asyncio.Lock)
 
+# One FIFO queue per guild
+_guild_queues: dict[int, asyncio.Queue] = defaultdict(asyncio.Queue)
+
+# Track the background worker task per guild
+_guild_workers: dict[int, asyncio.Task] = {}
+
 # ---------- ESPN image/constants ----------
 PLAYER_IMG = "https://a.espncdn.com/combiner/i?img=/i/headshots/nfl/players/full/{player_id}.png&w=200&h=200"
 TEAM_IMG = "https://a.espncdn.com/i/teamlogos/nfl/500/{code}.png"
@@ -129,6 +135,97 @@ async def detect_scoring_precision(league) -> int:
 
     _PRECISION_CACHE[league_id] = 2
     return 2
+
+async def _process_weeklyrecap(interaction: discord.Interaction):
+    """Runs the actual recap build/send for a single guild request."""
+    settings = await get_guild_settings(str(interaction.guild.id))
+    if not settings:
+        await interaction.followup.send("❌ This server hasn't been set up. Use `/setup` first.", ephemeral=True)
+        return
+
+    # Target channel (prefer configured channel)
+    channel = (
+        interaction.guild.get_channel(int(settings["channel_id"]))
+        if settings.get("channel_id") else interaction.channel
+    )
+
+    # Permission check
+    perms = channel.permissions_for(interaction.guild.me)
+    if not perms.send_messages or not perms.embed_links:
+        await interaction.followup.send(
+            f"❌ I don’t have permission to post embeds in {channel.mention}.",
+            ephemeral=True
+        )
+        return
+
+    # Build league + robust current week
+    league = await build_league_from_settings(settings)
+    current_week = (
+        int(getattr(league, "current_week", 0) or 0)
+        or int(getattr(league, "nfl_week", 0) or 0)
+        or 1
+    )
+    if current_week < 1:
+        current_week = 1
+
+    # Build pages (1..current_week)
+    week_pages: list[list[discord.Embed]] = []
+    for wk in range(1, current_week + 1):
+        try:
+            page = await build_week_page(league, wk)
+            if page:
+                week_pages.append(page)
+        except Exception as inner_e:
+            print(f"⚠️ Skipping week {wk} due to error: {inner_e}")
+
+    # Fallback to week 1 if nothing
+    if not week_pages:
+        try:
+            fallback = await build_week_page(league, 1)
+            if fallback:
+                week_pages.append(fallback)
+        except Exception as fe:
+            print(f"⚠️ Fallback week 1 failed: {fe}")
+
+    if not week_pages:
+        await interaction.followup.send("🤷 I couldn’t find any data to post yet.", ephemeral=True)
+        return
+
+    # Send with navigator
+    view = WeekNavigator(week_pages)
+    first_page = week_pages[-1]
+    message = await channel.send(embeds=first_page, view=view)
+    view.set_message(message)
+
+    await interaction.followup.send(
+        f"✅ Weekly recap posted in {channel.mention}.",
+        ephemeral=True
+    )
+
+async def _ensure_worker(guild_id: int):
+    """Start a background worker for this guild if one isn't already running."""
+    if guild_id in _guild_workers and not _guild_workers[guild_id].done():
+        return
+
+    async def _worker():
+        q = _guild_queues[guild_id]
+        while True:
+            interaction: discord.Interaction = await q.get()
+            try:
+                await _process_weeklyrecap(interaction)
+            except Exception as e:
+                # Best effort notify the requester
+                try:
+                    await interaction.followup.send(
+                        f"❌ Error while processing queued recap: `{e}`",
+                        ephemeral=True
+                    )
+                except Exception:
+                    pass
+            finally:
+                q.task_done()
+
+    _guild_workers[guild_id] = asyncio.create_task(_worker())
 
 async def build_weekly_top_embeds(league: League, week: int, precision: int, starters_only: bool = False) -> list[discord.Embed]:
     """Top player per position for a given week using box scores."""
@@ -487,77 +584,44 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # Weekly recap (with per-guild lock)
 @app_commands.guild_only()
 @bot.tree.command(name="weeklyrecap", description="Manually trigger a weekly recap")
-@app_commands.checks.cooldown(1, 10.0)  # 1 per 30s per guild
 async def weeklyrecap_slash(interaction: discord.Interaction):
+    # Acknowledge immediately so Discord doesn’t time out
     await interaction.response.defer(thinking=True, ephemeral=True)
-    async with _guild_locks[interaction.guild.id]:
-        try:
-            settings = await get_guild_settings(str(interaction.guild.id))
-            if not settings:
-                await interaction.followup.send("❌ This server hasn't been set up. Use `/setup` first.", ephemeral=True)
-                return
 
-            # Prefer configured channel; fallback to where command was used
-            channel = (
-                interaction.guild.get_channel(int(settings["channel_id"]))
-                if settings.get("channel_id") else interaction.channel
-            )
+    guild_id = interaction.guild.id
 
-            # Permission check
-            perms = channel.permissions_for(interaction.guild.me)
-            if not perms.send_messages or not perms.embed_links:
-                await interaction.followup.send(
-                    f"❌ I don’t have permission to post embeds in {channel.mention}.",
-                    ephemeral=True
-                )
-                return
+    # Quick preflight (fail fast before queuing)
+    settings = await get_guild_settings(str(guild_id))
+    if not settings:
+        await interaction.followup.send("❌ This server hasn't been set up. Use `/setup` first.", ephemeral=True)
+        return
 
-            # League + week (robust)
-            league = await build_league_from_settings(settings)
-            current_week = (
-                int(getattr(league, "current_week", 0) or 0)
-                or int(getattr(league, "nfl_week", 0) or 0)
-                or 1
-            )
-            if current_week < 1:
-                current_week = 1
+    # Prefer configured channel; fallback to where the command was used
+    channel = (
+        interaction.guild.get_channel(int(settings["channel_id"]))
+        if settings.get("channel_id") else interaction.channel
+    )
 
-            # Build week pages (1..current_week)
-            week_pages: list[list[discord.Embed]] = []
-            for wk in range(1, current_week + 1):
-                try:
-                    page = await build_week_page(league, wk)
-                    if page:
-                        week_pages.append(page)
-                except Exception as inner_e:
-                    print(f"⚠️ Skipping week {wk} due to error: {inner_e}")
+    # Permission check
+    perms = channel.permissions_for(interaction.guild.me)
+    if not perms.send_messages or not perms.embed_links:
+        await interaction.followup.send(
+            f"❌ I don’t have permission to post embeds in {channel.mention}.",
+            ephemeral=True
+        )
+        return
 
-            if not week_pages:
-                # Fallback to week 1 once
-                try:
-                    fallback = await build_week_page(league, 1)
-                    if fallback:
-                        week_pages.append(fallback)
-                except Exception as fe:
-                    print(f"⚠️ Fallback week 1 failed: {fe}")
+    # Enqueue and report position
+    q = _guild_queues[guild_id]
+    position = q.qsize() + 1  # 1-based: your spot after enqueue
+    await q.put(interaction)
+    await _ensure_worker(guild_id)
 
-            if not week_pages:
-                await interaction.followup.send("🤷 I couldn’t find any data to post yet.", ephemeral=True)
-                return
-
-            # Send with navigator
-            view = WeekNavigator(week_pages)
-            first_page = week_pages[-1]
-            message = await channel.send(embeds=first_page, view=view)
-            view.set_message(message)
-
-            await interaction.followup.send(
-                f"✅ Weekly recap posted in {channel.mention} with week navigation (current week: {current_week}).",
-                ephemeral=True
-            )
-
-        except Exception as e:
-            await interaction.followup.send(f"❌ Error while posting: `{e}`", ephemeral=True)
+    await interaction.followup.send(
+        f"🧾 You are **#{position}** in the queue. "
+        f"I’ll post the weekly recap in {channel.mention} when it’s ready.",
+        ephemeral=True
+    )
 
 @bot.tree.command(name="debug_week", description="Show detected current week values")
 @app_commands.guild_only()
