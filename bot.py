@@ -71,9 +71,68 @@ async def build_league_from_settings(settings) -> League:
         swid=settings["swid"]
     )
 
-async def build_weekly_top_embeds(league: League, week: int, starters_only: bool = False) -> list[discord.Embed]:
+# --- Scoring precision detection (0, 1, or 2 decimal places) ---
+_PRECISION_CACHE: dict[int, int] = {}
+
+def _fmt_points(val: float | int | None, precision: int) -> str:
+    if val is None:
+        return "0"
+    return f"{float(val):.{precision}f}"
+
+async def detect_scoring_precision(league) -> int:
+    """
+    Infer precision by sampling box score values and checking if they
+    align to 0, 1, or 2 decimal places. Caches per-league.
+    """
+    league_id = int(getattr(league, "league_id", 0) or 0)
+    if league_id in _PRECISION_CACHE:
+        return _PRECISION_CACHE[league_id]
+
+    # Choose up to two weeks to sample: current and week 1 (defensive)
+    current_week = (
+        int(getattr(league, "current_week", 0) or 0)
+        or int(getattr(league, "nfl_week", 0) or 0)
+        or 1
+    )
+    weeks_to_try = [max(1, current_week)]
+    if current_week != 1:
+        weeks_to_try.append(1)
+
+    samples: list[float] = []
+    for wk in weeks_to_try:
+        try:
+            boxes = await espn_call(league.box_scores, week=wk)
+            for g in boxes:
+                # team scores
+                if g.home_score is not None: samples.append(float(g.home_score))
+                if g.away_score is not None: samples.append(float(g.away_score))
+                # player points
+                for lineup in (g.home_lineup, g.away_lineup):
+                    for bp in lineup:
+                        pts = getattr(bp, "points", None)
+                        if pts is not None:
+                            samples.append(float(pts))
+        except Exception:
+            continue
+
+    # Fallback if we couldn't sample anything
+    if not samples:
+        _PRECISION_CACHE[league_id] = 2
+        return 2
+
+    # Check which precision cleanly represents all samples
+    for p in (0, 1, 2):
+        mult = 10 ** p
+        if all(abs(round(v * mult) - v * mult) < 1e-6 for v in samples):
+            _PRECISION_CACHE[league_id] = p
+            return p
+
+    _PRECISION_CACHE[league_id] = 2
+    return 2
+
+async def build_weekly_top_embeds(league: League, week: int, precision: int, starters_only: bool = False) -> list[discord.Embed]:
     """Top player per position for a given week using box scores."""
-    best: dict[str, dict | None] = {p: None for p in DESIRED_POSITIONS}
+    best = {p: None for p in DESIRED_POSITIONS}
     week_boxes = await espn_call(league.box_scores, week=week)
 
     for game in week_boxes:
@@ -120,10 +179,10 @@ async def build_weekly_top_embeds(league: League, week: int, starters_only: bool
             title=f"Week {week} Top {pos}",
             description=(
                 f"**{top['name']}** ({pos})\n"
-                f"Fantasy Points: **{top['points']:.2f}**\n"
+                f"Fantasy Points: **{_fmt_points(top['points'], precision)}**\n"
                 f"Fantasy Team: *{top['team']}*"
             ),
-            color=0x1abc9c  # teal/green for weekly tops
+            color=0x1abc9c
         )
         if image_url:
             e.set_thumbnail(url=image_url)
@@ -131,7 +190,7 @@ async def build_weekly_top_embeds(league: League, week: int, starters_only: bool
 
     return embeds
 
-async def build_season_top_embed_combined(league: League, end_week: int, starters_only: bool = False) -> discord.Embed:
+async def build_season_top_embed_combined(league: League, end_week: int, precision: int, starters_only: bool = False) -> discord.Embed:
     """Single embed with Top-5 for each position through end_week."""
     season_points: dict[str, dict[str, float]] = {p: {} for p in DESIRED_POSITIONS}
     for wk in range(1, end_week + 1):
@@ -154,7 +213,7 @@ async def build_season_top_embed_combined(league: League, end_week: int, starter
     lines = []
     for pos in DESIRED_POSITIONS:
         top5 = sorted(season_points[pos].items(), key=lambda x: x[1], reverse=True)[:5]
-        section = "\n".join(f"• **{name}** — {pts:.2f}" for name, pts in top5) if top5 else "_No data_"
+        section = "\n".join(f"• **{name}** — {_fmt_points(pts, precision)}" for name, pts in top5) if top5 else "_No data_"
         lines.append(f"**{pos}**\n{section}")
 
     # Purple so it’s visually distinct from H2H
@@ -164,43 +223,45 @@ async def build_season_top_embed_combined(league: League, end_week: int, starter
         color=0x9b59b6
     )
 
-async def build_head_to_head_embed(league: League, week: int) -> discord.Embed:
+async def build_head_to_head_embed(league: League, week: int, precision: int) -> discord.Embed:
     box_scores = await espn_call(league.box_scores, week=week)
     e = Embed(
         title=f"Week {week} Head-to-Head Matchups",
         description="🏈 Weekly fantasy results",
-        color=0xf39c12  # orange
+        color=0xf39c12
     )
     for game in box_scores:
         home, away = game.home_team, game.away_team
         hs, as_ = game.home_score, game.away_score
         hv, av = hasattr(home, "team_name"), hasattr(away, "team_name")
+
         if hv and av:
             winner = home if hs > as_ else away
-            win_score = max(hs, as_)
+            win_score = hs if hs > as_ else as_
             result = (
                 f"{home.team_name} ({home.wins}-{home.losses}) vs. {away.team_name} ({away.wins}-{away.losses})\n"
-                f"Score: {hs:.1f} - {as_:.1f}\n"
-                f"🏆 Winner: **{winner.team_name}** (**{win_score:.1f}**)"
+                f"Score: {_fmt_points(hs, precision)} - {_fmt_points(as_, precision)}\n"
+                f"🏆 Winner: **{winner.team_name}** (**{_fmt_points(win_score, precision)}**)"
             )
         elif hv:
             result = (
                 f"{home.team_name} ({home.wins}-{home.losses}) vs. BYE\n"
-                f"Score: {hs:.1f} - 0.0\n"
+                f"Score: {_fmt_points(hs, precision)} - {_fmt_points(0, precision)}\n"
                 f"🛌 **{home.team_name}** is on a bye week!"
             )
         elif av:
             result = (
                 f"BYE vs. {away.team_name} ({away.wins}-{away.losses})\n"
-                f"Score: 0.0 - {as_:.1f}\n"
+                f"Score: {_fmt_points(0, precision)} - {_fmt_points(as_, precision)}\n"
                 f"🛌 **{away.team_name}** is on a bye week!"
             )
         else:
             continue
+
         e.add_field(name="Matchup", value=result, inline=False)
     return e
 
-async def build_power_rankings_embed(league: League) -> discord.Embed:
+async def build_power_rankings_embed(league: League, precision: int) -> discord.Embed:
     teams = await espn_call(lambda: list(league.teams))
     teams = sorted(
         teams,
@@ -208,14 +269,12 @@ async def build_power_rankings_embed(league: League) -> discord.Embed:
     )
     e = Embed(title="📊 Power Rankings", description="Sorted by Wins, then Points For", color=0x2980b9)
     for i, team in enumerate(teams, 1):
+        pf = _fmt_points(getattr(team, "points_for", 0) or 0, precision)
+        pa = _fmt_points(getattr(team, "points_against", 0) or 0, precision)
         e.add_field(
             name=f"{i}. {team.team_name.strip()}",
-            value=(
-                f"Record: {getattr(team, 'wins', 0)}-{getattr(team, 'losses', 0)} | "
-                f"PF: {float(getattr(team, 'points_for', 0) or 0):.1f} | "
-                f"PA: {float(getattr(team, 'points_against', 0) or 0):.1f}"
-            ),
-            inline=False,
+            value=f"Record: {getattr(team, 'wins', 0)}-{getattr(team, 'losses', 0)} | PF: {pf} | PA: {pa}",
+            inline=False
         )
     return e
 
@@ -223,17 +282,18 @@ async def build_week_page(league: League, week: int) -> list[discord.Embed]:
     """One page for a given week, in this order:
        1) Head-to-head, 2) Weekly Top Players, 3) Season Top-5 (combined), 4) Power Rankings."""
     embeds: list[discord.Embed] = []
+    precision = await detect_scoring_precision(league)
     # 1) Head-to-Head
-    h2h = await build_head_to_head_embed(league, week)
+    h2h = await build_head_to_head_embed(league, week, precision)
     embeds.append(h2h)
     # 2) Weekly Top Players
-    weekly_top_embeds = await build_weekly_top_embeds(league, week)
+    weekly_top_embeds = await build_weekly_top_embeds(league, week, precision)
     embeds.extend(weekly_top_embeds)
     # 3) Season Top-5 (combined)
-    season_top_embed = await build_season_top_embed_combined(league, week)
+    season_top_embed = await build_season_top_embed_combined(league, week, precision)
     embeds.append(season_top_embed)
     # 4) Power Rankings
-    pr = await build_power_rankings_embed(league)
+    pr = await build_power_rankings_embed(league, precision)
     embeds.append(pr)
     return embeds[:10]  # Discord limit guard
 
@@ -427,7 +487,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # Weekly recap (with per-guild lock)
 @app_commands.guild_only()
 @bot.tree.command(name="weeklyrecap", description="Manually trigger a weekly recap")
-@app_commands.checks.cooldown(1, 30.0)  # 1 per 30s per guild
+@app_commands.checks.cooldown(1, 10.0)  # 1 per 30s per guild
 async def weeklyrecap_slash(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True, ephemeral=True)
     async with _guild_locks[interaction.guild.id]:
