@@ -72,6 +72,25 @@ def build_power_rankings_embed(league) -> discord.Embed:
         )
     return e
 
+def normalize_weekly_embed_heights(embed_list: list[discord.Embed]) -> None:
+    """
+    Make all weekly-top embeds the same visual height by padding their descriptions
+    to the max line count using zero-width space lines.
+    """
+    if not embed_list:
+        return
+
+    # Count lines per description (empty -> 0)
+    def line_count(e: discord.Embed) -> int:
+        return (e.description or "").count("\n") + (1 if (e.description or "") else 0)
+
+    max_lines = max(line_count(e) for e in embed_list)
+    for e in embed_list:
+        desc = e.description or ""
+        missing = max_lines - line_count(e)
+        if missing > 0:
+            # Add missing blank lines with zero-width spaces so Discord keeps them
+            e.description = desc + ("\n" + "\u200b") * missing
 
 async def build_week_page(league, week: int) -> list[discord.Embed]:
     """Return embeds for ONE week in the requested order:
@@ -84,7 +103,7 @@ async def build_week_page(league, week: int) -> list[discord.Embed]:
 
     # 2) Weekly Top Players (pad to align)
     weekly_top_embeds = await build_weekly_top_embeds(league, week)
-    pad_embeds(weekly_top_embeds)
+    normalize_weekly_embed_heights(weekly_top_embeds)
     embeds.extend(weekly_top_embeds)
 
     # 3) Season Top-5 (combined single embed) THROUGH selected week
