@@ -49,6 +49,21 @@ def build_league_from_settings(settings) -> League:
         swid=settings["swid"]
     )
 
+@bot.tree.command(name="show_settings", description="Show saved league settings for this server (admin only).")
+async def show_settings(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    s = await get_guild_settings(str(interaction.guild.id))
+    if not s:
+        await interaction.followup.send("No settings saved yet. Use `/setup`.", ephemeral=True)
+        return
+    # Don’t echo cookies back; just confirm presence.
+    msg = (
+        f"League ID: {s['league_id']}\n"
+        f"Season: {s['season']}\n"
+        f"Channel: <#{s['channel_id']}>\n"
+        f"Autopost: {'Enabled' if s.get('autopost_enabled') else 'Disabled'}"
+    )
+    await interaction.followup.send(msg, ephemeral=True)
 
 async def build_weekly_top_embeds(league: League, week: int, starters_only: bool = False) -> list[discord.Embed]:
     """Top player per position for a given week using box scores."""
