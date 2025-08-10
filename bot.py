@@ -1,4 +1,6 @@
-# bot.py
+
+BOT_VERSION = "0.9.0-beta"
+
 import os
 import asyncio
 from collections import defaultdict
@@ -42,15 +44,11 @@ async def espn_call(func, *args, **kwargs):
             timeout=ESPN_TIMEOUT_SECONDS
         )
 
-# Per-guild lock to keep one /weeklyrecap per server at a time (optional but nice)
-_guild_locks = defaultdict(asyncio.Lock)
-
 # ---- Global job queue (all guilds share this) ----
 _GLOBAL_QUEUE: asyncio.Queue[discord.Interaction] = asyncio.Queue()
 _GLOBAL_WORKERS: list[asyncio.Task] = []
 
 # Still keep a per-guild lock so two jobs from the SAME server don't overlap
-from collections import defaultdict
 _GUILD_LOCKS = defaultdict(asyncio.Lock)
 
 # How many jobs to process in parallel (separate from ESPN_MAX_CONCURRENCY)
@@ -140,6 +138,96 @@ async def detect_scoring_precision(league) -> int:
 
     _PRECISION_CACHE[league_id] = 2
     return 2
+
+def _pick_welcome_channel(guild: discord.Guild) -> discord.abc.Messageable | None:
+    # Prefer the server’s system channel if we can talk there
+    ch = guild.system_channel
+    if ch and ch.permissions_for(guild.me).send_messages and ch.permissions_for(guild.me).embed_links:
+        return ch
+    # Otherwise pick the first text channel we can post in
+    for c in guild.text_channels:
+        perms = c.permissions_for(guild.me)
+        if perms.send_messages and perms.embed_links:
+            return c
+    return None
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    channel = _pick_welcome_channel(guild)
+    if not channel:
+        return  # no suitable channel; fail silently
+
+    try:
+        embed = Embed(
+            title="Thanks for adding the ESPN Fantasy Football Bot! 🎉",
+            description=(
+                'Type **/setup** to begin the setup process, or **/help** to see what this bot can do.'
+            ),
+            color=0x5865F2  # Discord blurple
+        )
+        await channel.send(embed=embed)
+    except Exception as e:
+        print(f"Welcome message failed in guild {guild.id}: {e}")
+
+@app_commands.guild_only()
+@bot.tree.command(name="help", description="How to set up and use the bot")
+async def help_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    intro = Embed(
+        title="ESPN Fantasy Football Discord Bot — Help",
+        description=(
+            "*(This bot is **not** associated with ESPN)*\n\n"
+            "This bot can post weekly league insights:\n"
+            "1) Head-to-Head Matchup Results\n"
+            "2) Top Player per Position (Weekly)\n"
+            "3) Top 5 Points Leaders per Position (Season-to-date)\n"
+            "4) League Power Rankings\n\n"
+            "To get started, create a channel where the bot can post, then run **/setup**."
+        ),
+        color=0x3498db
+    )
+
+    setup = Embed(
+        title="Setup — What you need",
+        description=(
+            "**You’ll need:** LEAGUE_ID, SEASON (year), SWID, ESPN_S2, and the channel to post in.\n\n"
+            "**LEAGUE_ID**\n"
+            "Open your league in a browser and copy the numbers from the URL:\n"
+            "`https://fantasy.espn.com/football/league?leagueId=1234567`\n\n"
+            "**SEASON**\n"
+            "Enter the current fantasy season year (e.g., `2025`).\n\n"
+            "**SWID**\n"
+            "Open DevTools → Application/Storage → Cookies → `https://fantasy.espn.com/` → copy the full `SWID` value, **including braces** like `{1234-...}`.\n\n"
+            "**ESPN_S2**\n"
+            "From the same Cookies list, copy the `ESPN_S2` value **exactly as shown** (do not URL-encode)."
+        ),
+        color=0x2ecc71
+    )
+
+    commands = Embed(
+        title="Command List",
+        description=(
+            "• **/setup** — Initial setup for the bot.\n"
+            "• **/configure** — Update one or more saved settings.\n"
+            "• **/weeklyrecap** — Manually post the weekly recap.\n"
+            "• **/autopost** — Enable/disable Tuesday 11:00 AM ET autoposting.\n"
+            "• **/show_settings** — Show League ID, Season, Channel, and Autopost.\n"
+            "• **/help** — Show this help."
+        ),
+        color=0xf1c40f
+    )
+    
+    footer = Embed(
+        description=(
+            f"Developed by: **@minisotan**\n"
+            f"Version: `{BOT_VERSION}`\n"
+            "[GitHub Repository](https://github.com/minisotan/ESPNFantasyFootballDiscordBot)"
+        ),
+        color=0x95a5a6
+    )
+
+    await interaction.followup.send(embeds=[intro, setup, commands, footer], ephemeral=True)
 
 async def _process_weeklyrecap(interaction: discord.Interaction):
     """Runs the actual recap build/send for a single guild request."""
@@ -473,12 +561,6 @@ class WeekNavigator(View):
         await self.message.edit(embeds=self.week_embeds[self.index], view=self)
 
 # ---------- Commands ----------
-@bot.event
-async def on_ready():
-    await init_db()
-    await bot.tree.sync()
-    scheduler.start()
-    print(f"✅ Logged in as {bot.user}")
 
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
@@ -595,29 +677,12 @@ async def show_settings(interaction: discord.Interaction):
     )
     await interaction.followup.send(msg, ephemeral=True)
 
-# Cooldown feedback
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CommandOnCooldown):
-        try:
-            await interaction.response.send_message(
-                f"⏳ Cooldown: try again in {error.retry_after:.1f}s.",
-                ephemeral=True
-            )
-        except discord.InteractionResponded:
-            await interaction.followup.send(
-                f"⏳ Cooldown: try again in {error.retry_after:.1f}s.",
-                ephemeral=True
-            )
-
 # Weekly recap (with per-guild lock)
 @app_commands.guild_only()
 @bot.tree.command(name="weeklyrecap", description="Manually trigger a weekly recap")
 async def weeklyrecap_slash(interaction: discord.Interaction):
-    # Ack immediately so Discord doesn't time out
     await interaction.response.defer(thinking=True, ephemeral=True)
 
-    # Quick preflight (fail fast before queuing)
     settings = await get_guild_settings(str(interaction.guild.id))
     if not settings:
         await interaction.followup.send("❌ This server hasn't been set up. Use `/setup` first.", ephemeral=True)
@@ -635,18 +700,17 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
         )
         return
 
-    # Enqueue to the global queue and show GLOBAL position
-    position = _GLOBAL_QUEUE.qsize() + 1  # 1-based position after this enqueue
+    position = _GLOBAL_QUEUE.qsize() + 1
     await _GLOBAL_QUEUE.put(interaction)
     _ensure_global_workers()
 
-    # If you run multiple workers, make that clear in the message
-    parallel = " (processing up to "
-    parallel += f"{QUEUE_WORKERS} at a time)" if QUEUE_WORKERS > 1 else ")"
+    note = f" (processing up to {QUEUE_WORKERS} at a time)" if QUEUE_WORKERS > 1 else ""
     await interaction.followup.send(
-        f"Your Weekly Recap is being processed. Please wait while we gather data...",
+        f"🧾 You are **#{position}** in the global queue{note}. "
+        f"I’ll post the weekly recap in {channel.mention} when it’s ready.",
         ephemeral=True
     )
+
 
 
 @bot.tree.command(name="debug_week", description="Show detected current week values")
