@@ -71,6 +71,25 @@ Command List:
     /autopost - Enable or Disable autoposting so that the bot automatically sends its mesage on 11:00am EST each Tuesday.
     /showsettings - Shows the League ID, Season, Channel, and Autopost settings.
 
+## Bot Previews
+
+### Weekly Matchups
+![Weekly Matchups](images/WeeklyMatchups.PNG)
+
+### Top Players of the Week
+![Top Players of the Week](images/TopPlayersoftheWeek.PNG)
+
+### Top Players Per Position (Season-to-date)
+![Top Players Per Position](images/TopPlayersPerPosition.PNG)
+
+### Power Rankings
+![Power Rankings](images/PowerRankings.PNG)
+
+### Navigation Controls
+![Navigation](images/Navigation.PNG)
+
+### Help Command
+![Help Command](images/Help.PNG)
 
 Developed by: @minisotan
  

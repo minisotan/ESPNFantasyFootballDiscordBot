@@ -900,21 +900,6 @@ async def weeklyrecap_slash(interaction: discord.Interaction):
         ephemeral=True
     )
 
-
-
-@bot.tree.command(name="debug_week", description="Show detected current week values")
-@app_commands.guild_only()
-async def debug_week(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    settings = await get_guild_settings(str(interaction.guild.id))
-    if not settings:
-        await interaction.followup.send("No settings found.", ephemeral=True)
-        return
-    league = await build_league_from_settings(settings)
-    cw = getattr(league, "current_week", None)
-    nw = getattr(league, "nfl_week", None)
-    await interaction.followup.send(f"current_week={cw!r}, nfl_week={nw!r}", ephemeral=True)
-
 # ---------- Scheduler (auto-post Tuesdays 11:00 AM ET) ----------
 @scheduler.scheduled_job("cron", day_of_week="tue", hour=11, minute=0)
 async def auto_post_weekly_recap():
