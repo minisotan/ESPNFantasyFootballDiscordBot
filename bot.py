@@ -1,15 +1,20 @@
-
-BOT_VERSION = "0.9.0-beta"
+BOT_VERSION = "0.9.1-beta"
 
 import os
 import asyncio
-from collections import defaultdict
 import discord
+import aiohttp
+import urllib.parse
+from collections import defaultdict
+from discord import Webhook
 from discord.ext import commands
 from discord.ui import Button, View, Select
 from discord import app_commands, Embed
+from discord.app_commands import checks as app_checks
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from zoneinfo import ZoneInfo
+from dotenv import load_dotenv
+load_dotenv()
 
 from espn_api.football import League
 from settings_manager import (
@@ -26,6 +31,11 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Scheduler in ET (DST-aware): Tuesdays @ 11:00 AM
 scheduler = AsyncIOScheduler(timezone=ZoneInfo("America/New_York"))
+
+#Webhook URLs for home server
+HOME_BUGS_WEBHOOK_URL = os.getenv("HOME_BUGS_WEBHOOK_URL", "")
+HOME_FEEDBACK_WEBHOOK_URL = os.getenv("HOME_FEEDBACK_WEBHOOK_URL", "")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 # ---------- Global ESPN concurrency gate ----------
 ESPN_MAX_CONCURRENCY = int(os.getenv("ESPN_MAX_CONCURRENCY", "1"))       # how many ESPN calls at once
@@ -79,6 +89,72 @@ async def build_league_from_settings(settings) -> League:
         espn_s2=settings["espn_s2"],
         swid=settings["swid"]
     )
+
+# ---------- Reports ----------
+async def send_to_home_webhook(report_type: str, embed: discord.Embed, gh_url: str, jump_url: str):
+    """
+    report_type: 'bug' or 'feedback'
+    embed:       the embed you already built for the in-guild notification
+    gh_url:      the prefilled GitHub issue link
+    jump_url:    the Discord 'jump to interaction' URL
+    """
+    url = HOME_BUGS_WEBHOOK_URL if report_type == "bug" else HOME_FEEDBACK_WEBHOOK_URL
+    if not url:
+        # Optional: DM fallback
+        if OWNER_ID:
+            try:
+                owner = await bot.fetch_user(OWNER_ID)
+                # Include links in the DM in case components aren't supported
+                dm_embed = embed.copy()
+                dm_embed.add_field(name="GitHub Issue", value=gh_url, inline=False)
+                dm_embed.add_field(name="Jump to Interaction", value=jump_url, inline=False)
+                await owner.send(embed=dm_embed)
+                return True
+            except Exception:
+                return False
+        return False
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            webhook = Webhook.from_url(url, session=session)
+
+            # Try sending with buttons first
+            view = discord.ui.View()
+            view.add_item(discord.ui.Button(label="Open GitHub Issue", url=gh_url))
+            view.add_item(discord.ui.Button(label="Jump to Interaction", url=jump_url))
+            await webhook.send(embed=embed, view=view, wait=True)
+            return True
+    except Exception:
+        # Fallback: no components, just links in the embed
+        try:
+            async with aiohttp.ClientSession() as session:
+                webhook = Webhook.from_url(url, session=session)
+                fallback = embed.copy()
+                fallback.add_field(name="GitHub Issue", value=gh_url, inline=False)
+                fallback.add_field(name="Jump to Interaction", value=jump_url, inline=False)
+                await webhook.send(embed=fallback, wait=True)
+                return True
+        except Exception:
+            # Optional: DM fallback if webhook also fails
+            if OWNER_ID:
+                try:
+                    owner = await bot.fetch_user(OWNER_ID)
+                    dm_embed = embed.copy()
+                    dm_embed.add_field(name="GitHub Issue", value=gh_url, inline=False)
+                    dm_embed.add_field(name="Jump to Interaction", value=jump_url, inline=False)
+                    await owner.send(embed=dm_embed)
+                    return True
+                except Exception:
+                    pass
+            return False
+
+# --- GitHub Issues URL ---
+def _github_issue_url(title: str, body: str) -> str:
+    # Update to your repo if needed
+    repo = "minisotan/ESPNFantasyFootballDiscordBot"
+    base = f"https://github.com/{repo}/issues/new"
+    params = {"title": title[:120], "body": body[:6000]}
+    return f"{base}?{urllib.parse.urlencode(params)}"
 
 # --- Scoring precision detection (0, 1, or 2 decimal places) ---
 _PRECISION_CACHE: dict[int, int] = {}
@@ -213,7 +289,9 @@ async def help_cmd(interaction: discord.Interaction):
             "• **/weeklyrecap** — Manually post the weekly recap.\n"
             "• **/autopost** — Enable/disable Tuesday 11:00 AM ET autoposting.\n"
             "• **/show_settings** — Show League ID, Season, Channel, and Autopost.\n"
-            "• **/help** — Show this help."
+            "• **/help** — Show this help. \n"
+            "• **/feedback** — Send feedback or feature requests. \n"
+            "• **/bugreport** — Report a bug with severity and details. \n"
         ),
         color=0xf1c40f
     )
@@ -641,6 +719,117 @@ async def configure(
     }
     await set_guild_settings(guild_id, **updated)
     await interaction.followup.send("✅ Settings updated successfully!", ephemeral=True)
+
+@app_commands.guild_only()
+@app_checks.cooldown(2, 60.0)  # per-user cooldown
+@bot.tree.command(name="feedback", description="Send general feedback or feature requests to the developer")
+@app_commands.describe(
+    message="Your feedback or feature request (1–1000 chars)",
+    category="Optional tag to help triage"
+)
+@app_commands.choices(category=[
+    app_commands.Choice(name="Feature Request", value="feature"),
+    app_commands.Choice(name="UI/UX", value="ui"),
+    app_commands.Choice(name="Performance", value="performance"),
+    app_commands.Choice(name="Other", value="other"),
+])
+async def feedback_cmd(
+    interaction: discord.Interaction,
+    message: str,
+    category: app_commands.Choice[str] | None = None
+):
+    await interaction.response.defer(ephemeral=True)
+
+    msg = (message or "").strip()
+    if not (1 <= len(msg) <= 1000):
+        await interaction.followup.send("❌ Please keep feedback between 1 and 1000 characters.", ephemeral=True)
+        return
+
+    tag = category.value if category else "general"
+    # Build the embed sent to your private home server webhook
+    e = Embed(
+        title="🗣️ New Feedback",
+        description=msg,
+        color=0x00A67E
+    )
+    e.add_field(name="From", value=f"{interaction.user.mention} ({interaction.user.id})", inline=False)
+    e.add_field(name="Guild", value=f"{interaction.guild.name} ({interaction.guild.id})", inline=False)
+    e.add_field(name="Category", value=tag, inline=True)
+    e.set_footer(text=f"BOT v{BOT_VERSION} • feedback")
+
+    # Helpful links for you (prefilled GitHub issue + jump URL)
+    gh_title = f"[Feedback] from {interaction.user.name}"
+    gh_body = (
+        f"**Guild:** {interaction.guild.name} ({interaction.guild.id})\n"
+        f"**User:** {interaction.user} ({interaction.user.id})\n"
+        f"**Category:** {tag}\n\n"
+        f"**Message:**\n{msg}"
+    )
+    gh_url = _github_issue_url(gh_title, gh_body)
+    jump_url = f"https://discord.com/channels/{interaction.guild.id}/{interaction.channel.id}"
+
+    # Always send to your HOME_FEEDBACK_WEBHOOK_URL
+    _ = await send_to_home_webhook("feedback", e, gh_url, jump_url)
+
+    await interaction.followup.send("✅ Thanks! Your feedback was submitted.", ephemeral=True)
+
+@app_commands.guild_only()
+@app_checks.cooldown(2, 60.0)  # per-user cooldown
+@bot.tree.command(name="bugreport", description="Report a bug with severity and details")
+@app_commands.describe(
+    title="Short bug title (3–120 chars)",
+    details="What happened / steps to reproduce (5–1500 chars)",
+    severity="How bad is it?"
+)
+@app_commands.choices(severity=[
+    app_commands.Choice(name="Low", value="low"),
+    app_commands.Choice(name="Medium", value="medium"),
+    app_commands.Choice(name="High", value="high"),
+    app_commands.Choice(name="Critical", value="critical"),
+])
+async def bugreport_cmd(
+    interaction: discord.Interaction,
+    title: str,
+    details: str,
+    severity: app_commands.Choice[str] | None = None
+):
+    await interaction.response.defer(ephemeral=True)
+
+    t = (title or "").strip()
+    d = (details or "").strip()
+    if not (3 <= len(t) <= 120):
+        await interaction.followup.send("❌ Title must be 3–120 characters.", ephemeral=True)
+        return
+    if not (5 <= len(d) <= 1500):
+        await interaction.followup.send("❌ Details must be 5–1500 characters.", ephemeral=True)
+        return
+
+    sev = severity.value if severity else "medium"
+
+    e = Embed(
+        title=f"🐞 Bug Report — {t}",
+        description=d,
+        color=0xE74C3C
+    )
+    e.add_field(name="From", value=f"{interaction.user.mention} ({interaction.user.id})", inline=False)
+    e.add_field(name="Guild", value=f"{interaction.guild.name} ({interaction.guild.id})", inline=False)
+    e.add_field(name="Severity", value=sev, inline=True)
+    e.set_footer(text=f"BOT v{BOT_VERSION} • bug")
+
+    gh_title = f"[Bug] {t}"
+    gh_body = (
+        f"**Guild:** {interaction.guild.name} ({interaction.guild.id})\n"
+        f"**User:** {interaction.user} ({interaction.user.id})\n"
+        f"**Severity:** {sev}\n\n"
+        f"**Details / Steps to Reproduce:**\n{d}"
+    )
+    gh_url = _github_issue_url(gh_title, gh_body)
+    jump_url = f"https://discord.com/channels/{interaction.guild.id}/{interaction.channel.id}"
+
+    # Always send to your HOME_BUGS_WEBHOOK_URL
+    _ = await send_to_home_webhook("bug", e, gh_url, jump_url)
+
+    await interaction.followup.send("✅ Thanks! Your bug has been reported.", ephemeral=True)
 
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
