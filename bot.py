@@ -364,9 +364,8 @@ async def _process_weeklyrecap(interaction: discord.Interaction):
 
     # Send with navigator
     view = WeekNavigator(week_pages)
-    first_page = week_pages[-1]
-    message = await channel.send(embeds=first_page, view=view)
-    view.set_message(message)
+    await channel.send(embeds=week_pages[-1], view=view)
+
 
     await interaction.followup.send(
         f"✅ Weekly recap posted in {channel.mention}.",
@@ -594,49 +593,52 @@ class WeekNavigator(View):
     def __init__(self, week_embeds: list[list[discord.Embed]]):
         super().__init__(timeout=300)
         self.week_embeds = week_embeds
-        self.index = len(week_embeds) - 1
-        self.message: discord.Message | None = None
+        self.index = len(week_embeds) - 1  # start at most recent week
 
-        options = [discord.SelectOption(label=f"Week {i+1}", value=str(i)) for i in range(len(week_embeds))]
+        # Dropdown
+        options = [
+            discord.SelectOption(label=f"Week {i+1}", value=str(i))
+            for i in range(len(week_embeds))
+        ]
         self.select = Select(placeholder="Jump to week…", min_values=1, max_values=1, options=options)
         self.select.callback = self.jump_to_week
         self.add_item(self.select)
 
-    def set_message(self, message: discord.Message):
-        self.message = message
+        # Set initial disabled state
+        # (button attributes exist thanks to the decorators below)
+        self._update_button_states()
 
-    def update_button_states(self):
+    def _update_button_states(self):
+        # These attributes are created by the decorators (@discord.ui.button)
         self.previous.disabled = (self.index == 0)
         self.next.disabled = (self.index == len(self.week_embeds) - 1)
 
     @discord.ui.button(label="⬅️", style=discord.ButtonStyle.primary)
     async def previous(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer()
         if self.index > 0:
             self.index -= 1
-        self.update_button_states()
-        await self.message.edit(embeds=self.week_embeds[self.index], view=self)
+        self._update_button_states()
+        await interaction.response.edit_message(embeds=self.week_embeds[self.index], view=self)
 
     @discord.ui.button(label="➡️", style=discord.ButtonStyle.primary)
     async def next(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer()
         if self.index < len(self.week_embeds) - 1:
             self.index += 1
-        self.update_button_states()
-        await self.message.edit(embeds=self.week_embeds[self.index], view=self)
+        self._update_button_states()
+        await interaction.response.edit_message(embeds=self.week_embeds[self.index], view=self)
 
     @discord.ui.button(label="⏹ Reset", style=discord.ButtonStyle.danger)
     async def reset(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer()
         self.index = len(self.week_embeds) - 1
-        self.update_button_states()
-        await self.message.edit(embeds=self.week_embeds[self.index], view=self)
+        self._update_button_states()
+        await interaction.response.edit_message(embeds=self.week_embeds[self.index], view=self)
 
     async def jump_to_week(self, interaction: discord.Interaction):
-        await interaction.response.defer()
+        # value comes in as a string index from the Select
         self.index = int(self.select.values[0])
-        self.update_button_states()
-        await self.message.edit(embeds=self.week_embeds[self.index], view=self)
+        self._update_button_states()
+        await interaction.response.edit_message(embeds=self.week_embeds[self.index], view=self)
+
 
 # ---------- Commands ----------
 
