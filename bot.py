@@ -591,7 +591,7 @@ async def build_week_page(league: League, week: int) -> list[discord.Embed]:
 # ---------- Week Navigator ----------
 class WeekNavigator(View):
     def __init__(self, week_embeds: list[list[discord.Embed]]):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.week_embeds = week_embeds
         self.index = len(week_embeds) - 1  # start at most recent week
 

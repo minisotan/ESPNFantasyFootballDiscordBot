@@ -1,10 +1,10 @@
 Thank you for adding the ESPN Fantasy Football Discord Bot!
 
-(This bot is not associatedc with ESPN)
+(This bot is not associated with ESPN)
 
 This is a bot that will send helpful data related to your fantasty football league including:
 
-    1. Head to Head MAtchup Results
+    1. Head to Head Matchup Results
     2. The Top Player per Position of the Week
     3. The Top 5 Points Leaders per Position
     4. League Power Rankings
