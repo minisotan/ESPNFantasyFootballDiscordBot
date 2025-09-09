@@ -1,4 +1,4 @@
-BOT_VERSION = "0.9.1-beta"
+BOT_VERSION = "0.9.2-beta"
 
 import os
 import asyncio
@@ -59,7 +59,7 @@ _GLOBAL_QUEUE: asyncio.Queue[discord.Interaction] = asyncio.Queue()
 _GLOBAL_WORKERS: list[asyncio.Task] = []
 
 # Still keep a per-guild lock so two jobs from the SAME server don't overlap
-_GUILD_LOCKS = defaultdict(asyncio.Lock)
+_GUILD_LOCKS = defaultdict(lambda: asyncio.Lock())
 
 # How many jobs to process in parallel (separate from ESPN_MAX_CONCURRENCY)
 QUEUE_WORKERS = int(os.getenv("QUEUE_WORKERS", "1"))  # 1 = strict FIFO; >1 = parallel consumption
@@ -80,6 +80,58 @@ TEAM_LOGO = {
 DESIRED_POSITIONS = ['QB', 'RB', 'WR', 'TE', 'K', 'D/ST']
 
 # ---------- Helpers ----------
+
+async def _is_week_complete(league, week: int) -> bool:
+    """
+    A week is 'complete' if every matchup has real scores for both teams
+    (not None), and each team has at least one lineup entry with points.
+    This avoids treating future/in-progress weeks as complete.
+    """
+    try:
+        boxes = await espn_call(league.box_scores, week=week)
+    except Exception:
+        return False
+
+    if not boxes:
+        return False
+
+    for g in boxes:
+        # If any score is None, week isn't done.
+        if (getattr(g, "home_score", None) is None) or (getattr(g, "away_score", None) is None):
+            return False
+
+        # Require at least one player with points on each side to avoid 0–0 placeholders.
+        def _has_points(lineup):
+            for bp in lineup or []:
+                pts = getattr(bp, "points", None)
+                if pts is not None and float(pts) > 0.0:
+                    return True
+            return False
+
+        if not _has_points(getattr(g, "home_lineup", [])):  # if lineups are empty/non-scored, it's likely not final
+            return False
+        if not _has_points(getattr(g, "away_lineup", [])):
+            return False
+
+    return True
+
+
+async def _last_completed_week(league) -> int:
+    """
+    Walk from week 1 up to 'current' and return the highest week that
+    satisfies _is_week_complete. Fallback to 1 if nothing else qualifies.
+    """
+    current_week = (
+        int(getattr(league, "current_week", 0) or 0)
+        or int(getattr(league, "nfl_week", 0) or 0)
+        or 1
+    )
+    last_done = 0
+    for wk in range(1, max(1, current_week) + 1):
+        if await _is_week_complete(league, wk):
+            last_done = wk
+    return last_done or 1
+
 async def build_league_from_settings(settings) -> League:
     # espn_api does network IO in League(...), so offload it too
     return await espn_call(
@@ -331,17 +383,12 @@ async def _process_weeklyrecap(interaction: discord.Interaction):
 
     # Build league + robust current week
     league = await build_league_from_settings(settings)
-    current_week = (
-        int(getattr(league, "current_week", 0) or 0)
-        or int(getattr(league, "nfl_week", 0) or 0)
-        or 1
-    )
-    if current_week < 1:
-        current_week = 1
 
-    # Build pages (1..current_week)
+    # Only show fully completed weeks
+    last_week = max(1, await _last_completed_week(league))
+
     week_pages: list[list[discord.Embed]] = []
-    for wk in range(1, current_week + 1):
+    for wk in range(1, last_week + 1):
         try:
             page = await build_week_page(league, wk)
             if page:
@@ -363,7 +410,7 @@ async def _process_weeklyrecap(interaction: discord.Interaction):
         return
 
     # Send with navigator
-    view = WeekNavigator(week_pages)
+    view = WeekNavigator(week_pages) if len(week_pages) > 1 else None
     await channel.send(embeds=week_pages[-1], view=view)
 
 
@@ -915,16 +962,15 @@ async def auto_post_weekly_recap():
             if not isinstance(channel, (discord.TextChannel, discord.Thread)):
                 continue
 
-            league = await build_league_from_settings(settings)
-            week = (
-                int(getattr(league, "current_week", 0) or 0)
-                or int(getattr(league, "nfl_week", 0) or 0)
-                or 1
-            )
-            if week < 1:
-                week = 1
+            # Optional: ensure we can post embeds here
+            perms = channel.permissions_for(guild.me)
+            if not perms.send_messages or not perms.embed_links:
+                continue
 
-            page = await build_week_page(league, week)
+            league = await build_league_from_settings(settings)
+            week = max(1, await _last_completed_week(league))
+
+            page = await build_week_page(league, week)   # (remove the duplicate call)
             if not page:
                 await channel.send(f"🤷 No data available for week {week} yet.")
             else:
