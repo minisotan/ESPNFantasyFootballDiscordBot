@@ -1,5 +1,9 @@
 Thank you for adding the ESPN Fantasy Football Discord Bot!
 
+
+### Invite Link
+![Invite Link](https://discord.com/oauth2/authorize?client_id=1101905611429519533)
+
 (This bot is not associated with ESPN)
 
 This is a bot that will send helpful data related to your fantasty football league including:
