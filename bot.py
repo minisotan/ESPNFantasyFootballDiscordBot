@@ -438,7 +438,8 @@ async def on_ready():
     await init_db()
     await bot.tree.sync()
     _ensure_global_workers()   # <--- start workers
-    scheduler.start()
+    if not scheduler.running:
+        scheduler.start()
     print(f"✅ Logged in as {bot.user}")
 
 def _ensure_global_workers():
